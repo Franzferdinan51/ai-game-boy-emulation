@@ -1,5 +1,5 @@
 """
-PyBoy emulator implementation
+PyBoy emulator implementation with performance optimizations
 """
 import numpy as np
 from typing import List, Tuple, Optional, Any
@@ -11,6 +11,28 @@ import subprocess
 import threading
 import multiprocessing
 import time
+import hashlib
+
+# Performance optimization imports
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+# Multi-processing support
+try:
+    import multiprocessing as mp
+    from multiprocessing import Queue, Process, Event, Manager
+    MP_AVAILABLE = True
+except ImportError:
+    MP_AVAILABLE = False
 
 # Try to import PyBoy
 try:
@@ -41,6 +63,20 @@ class PyBoyEmulator(EmulatorInterface):
         self.game_wrapper = None
         self.ui_process = None
         self.ui_thread = None
+
+        # Performance optimization attributes
+        self._screen_cache = {}
+        self._screen_cache_enabled = True
+        self._last_screen_hash = None
+        self._frame_counter = 0
+        self._fps_tracker = []
+        self._last_fps_time = time.time()
+        self._performance_stats = {
+            'screen_captures': 0,
+            'cache_hits': 0,
+            'conversion_time': 0,
+            'avg_fps': 0
+        }
 
     def load_rom(self, rom_path: str) -> bool:
         """Load a ROM file into the PyBoy emulator using official API"""
@@ -93,10 +129,53 @@ class PyBoyEmulator(EmulatorInterface):
             logger.error(f"Error loading ROM: {e}")
             return False
 
+    def _validate_rom_path(self, rom_path: str) -> bool:
+        """Validate ROM path for security"""
+        if not rom_path or not isinstance(rom_path, str):
+            return False
+
+        # Normalize path to prevent directory traversal
+        try:
+            normalized_path = os.path.normpath(os.path.abspath(rom_path))
+        except (OSError, ValueError):
+            return False
+
+        # Check if path is within allowed directories
+        allowed_dirs = [
+            os.path.abspath(os.path.dirname(self.rom_path)) if self.rom_path else "",
+            os.path.abspath("C:\\Users\\Ryan\\Desktop\\ROMS\\PyGB")
+        ]
+
+        if not any(normalized_path.startswith(allowed_dir) for allowed_dir in allowed_dirs if allowed_dir):
+            return False
+
+        # Check file extension
+        if not normalized_path.lower().endswith(('.gb', '.gbc', '.rom')):
+            return False
+
+        # Check if file exists and is a file
+        if not os.path.isfile(normalized_path):
+            return False
+
+        # Check file size (max 16MB for Game Boy ROMs)
+        try:
+            file_size = os.path.getsize(normalized_path)
+            if file_size > 16 * 1024 * 1024:  # 16MB
+                return False
+        except OSError:
+            return False
+
+        return True
+
     def _launch_ui_process(self):
-        """Launch PyBoy UI in a separate process"""
+        """Launch PyBoy UI in a separate process using secure approach"""
         if not self.rom_path or not os.path.exists(self.rom_path):
             logger.error("Cannot launch UI - no ROM loaded")
+            return
+
+        # Validate ROM path for security
+        if not self._validate_rom_path(self.rom_path):
+            logger.error(f"Invalid ROM path: {self.rom_path}")
             return
 
         try:
@@ -105,76 +184,62 @@ class PyBoyEmulator(EmulatorInterface):
             logger.info(f"ROM exists: {os.path.exists(self.rom_path)}")
             logger.info(f"Working directory: {os.getcwd()}")
 
-            # Create a simple script to run PyBoy with UI
-            ui_script = f'''
-import sys
-import os
-import time
+            # Use secure template-based approach instead of dynamic script generation
+            # Load the UI script from a predefined template file
+            template_path = os.path.join(os.path.dirname(__file__), "ui_script_template.py")
 
-print("=== PYBOY UI SCRIPT STARTING ===")
-print(f"Python version: {{sys.version}}")
-print(f"Working directory: {{os.getcwd()}}")
-print(f"ROM path: {repr(self.rom_path)}")
+            # If template doesn't exist, create a secure hardcoded version
+            if not os.path.exists(template_path):
+                self._create_ui_script_template(template_path)
 
-# Add PyBoy path to Python path
-sys.path.insert(0, "C:\\Users\\Ryan\\Desktop\\ROMS\\PyGB\\PyBoy")
-sys.path.insert(0, "C:\\Users\\Ryan\\Desktop\\ROMS\\PyGB")
+            # Create a temporary script file with validated parameters
+            import tempfile
+            import shutil
 
-try:
-    print("Importing PyBoy...")
-    from pyboy import PyBoy
-    print("PyBoy imported successfully")
+            # Create secure temporary file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as temp_script:
+                script_path = temp_script.name
 
-    print(f"Loading ROM: {repr(self.rom_path)}")
-    if not os.path.exists(self.rom_path):
-        print(f"ERROR: ROM file not found: {repr(self.rom_path)}")
-        sys.exit(1)
+                # Read template and substitute validated parameters
+                with open(template_path, 'r') as template_file:
+                    template_content = template_file.read()
 
-    pyboy = PyBoy(self.rom_path, window="SDL2", scale=2, sound_emulated=False, debug=False)
-    print("PyBoy initialized successfully")
-    pyboy.set_emulation_speed(1)
-    print("Emulation speed set to 1")
+                # Safe parameter substitution
+                safe_rom_path = repr(self.rom_path)  # Properly escape the path
+                safe_pyboy_path = repr("C:\\Users\\Ryan\\Desktop\\ROMS\\PyGB\\PyBoy")
+                safe_project_path = repr("C:\\Users\\Ryan\\Desktop\\ROMS\\PyGB")
 
-    frame_count = 0
-    print("Starting UI loop...")
-    # Keep the UI running
-    while True:
-        try:
-            pyboy.tick(1, True)
-            frame_count += 1
-            if frame_count % 60 == 0:  # Log every 2 seconds at 30fps
-                print(f"UI frame: {{frame_count}}")
-        except Exception as tick_error:
-            print(f"Tick error: {{tick_error}}")
-            time.sleep(0.1)
-        except KeyboardInterrupt:
-            print("UI interrupted by user")
-            break
+                # Substitute parameters safely
+                script_content = template_content.replace('{{ROM_PATH}}', safe_rom_path)
+                script_content = script_content.replace('{{PYBOY_PATH}}', safe_pyboy_path)
+                script_content = script_content.replace('{{PROJECT_PATH}}', safe_project_path)
 
-except KeyboardInterrupt:
-    print("UI interrupted by user")
-except Exception as e:
-    print(f"UI process error: {{e}}")
-    import traceback
-    traceback.print_exc()
-finally:
-    print("UI process ending")
-'''
+                temp_script.write(script_content)
+                temp_script.flush()
 
-            # Write the script to a temporary file
-            script_path = os.path.join(os.path.dirname(self.rom_path), f"ui_script_{os.getpid()}.py")
-            logger.info(f"Writing UI script to: {script_path}")
+                # Set secure file permissions
+                os.chmod(script_path, 0o600)  # Read/write for owner only
 
-            with open(script_path, 'w') as f:
-                f.write(ui_script)
+            logger.info(f"UI script written to: {script_path}")
 
-            logger.info(f"UI script written successfully")
-
-            # Launch the UI process with enhanced logging
+            # Launch the UI process with enhanced security
             logger.info("Starting UI subprocess...")
+
+            # Use secure subprocess execution
             self.ui_process = subprocess.Popen([
                 sys.executable, script_path
-            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, text=True)
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            text=True,
+            # Security enhancements
+            shell=False,  # Never use shell=True
+            env={  # Clean environment
+                'PYTHONPATH': "C:\\Users\\Ryan\\Desktop\\ROMS\\PyGB\\PyBoy;C:\\Users\\Ryan\\Desktop\\ROMS\\PyGB",
+                'PYTHONUNBUFFERED': '1'
+            }
+            )
 
             # Wait a moment and check if process started
             time.sleep(1)
@@ -231,6 +296,69 @@ finally:
             logger.error(f"Traceback: {traceback.format_exc()}")
             self.ui_launched = False
 
+    def _create_ui_script_template(self, template_path: str):
+        """Create a secure UI script template"""
+        template_content = '''import sys
+import os
+import time
+
+print("=== PYBOY UI SCRIPT STARTING ===")
+print(f"Python version: {sys.version}")
+print(f"Working directory: {os.getcwd()}")
+print(f"ROM path: {{ROM_PATH}}")
+
+# Add PyBoy path to Python path
+sys.path.insert(0, {{PYBOY_PATH}})
+sys.path.insert(0, {{PROJECT_PATH}})
+
+try:
+    print("Importing PyBoy...")
+    from pyboy import PyBoy
+    print("PyBoy imported successfully")
+
+    print(f"Loading ROM: {{ROM_PATH}}")
+    rom_path = {{ROM_PATH}}
+    if not os.path.exists(rom_path):
+        print(f"ERROR: ROM file not found: {rom_path}")
+        sys.exit(1)
+
+    pyboy = PyBoy(rom_path, window="SDL2", scale=2, sound_emulated=False, debug=False)
+    print("PyBoy initialized successfully")
+    pyboy.set_emulation_speed(1)
+    print("Emulation speed set to 1")
+
+    frame_count = 0
+    print("Starting UI loop...")
+    # Keep the UI running
+    while True:
+        try:
+            pyboy.tick(1, True)
+            frame_count += 1
+            if frame_count % 60 == 0:  # Log every 2 seconds at 30fps
+                print(f"UI frame: {frame_count}")
+        except Exception as tick_error:
+            print(f"Tick error: {tick_error}")
+            time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("UI interrupted by user")
+            break
+
+except KeyboardInterrupt:
+    print("UI interrupted by user")
+except Exception as e:
+    print(f"UI process error: {e}")
+    import traceback
+    traceback.print_exc()
+finally:
+    print("UI process ending")
+'''
+
+        # Write template with secure permissions
+        with open(template_path, 'w') as f:
+            f.write(template_content)
+        os.chmod(template_path, 0o644)  # Read/write for owner, read for others
+        logger.info(f"Created UI script template: {template_path}")
+
     def step(self, action: str, frames: int = 1) -> bool:
         """Execute an action for a number of frames using official PyBoy API"""
         if not self.initialized or self.pyboy is None:
@@ -277,10 +405,14 @@ finally:
             return False
 
     def get_screen(self) -> np.ndarray:
-        """Get the current screen as a numpy array using proper PyBoy API"""
+        """Get the current screen as a numpy array with performance optimizations"""
         if not self.initialized or self.pyboy is None:
             logger.warning("PyBoy not initialized, returning black screen")
             return np.zeros((144, 160, 3), dtype=np.uint8)
+
+        # Performance tracking
+        start_time = time.time()
+        self._performance_stats['screen_captures'] += 1
 
         try:
             # Use PyBoy's official screen API - get the screen buffer directly
@@ -291,22 +423,37 @@ finally:
                 logger.warning("Screen buffer is empty, returning black screen")
                 return np.zeros((144, 160, 3), dtype=np.uint8)
 
-            # PyBoy returns RGBA format (144, 160, 4) according to official documentation
-            # Convert to RGB by removing alpha channel
+            # Check cache if enabled
+            if self._screen_cache_enabled:
+                screen_hash = self._calculate_screen_hash(screen_array)
+                if screen_hash == self._last_screen_hash and screen_hash in self._screen_cache:
+                    self._performance_stats['cache_hits'] += 1
+                    self._update_fps_counter(time.time() - start_time)
+                    return self._screen_cache[screen_hash]
+                self._last_screen_hash = screen_hash
+
+            # Optimized format conversion
             if len(screen_array.shape) == 3 and screen_array.shape[2] == 4:
-                screen_array = screen_array[:, :, :3]  # Remove alpha channel
+                # Fast RGBA to RGB conversion using numpy slicing
+                screen_array = screen_array[:, :, :3]
             elif len(screen_array.shape) != 3 or screen_array.shape[2] != 3:
                 logger.error(f"Unexpected screen format from PyBoy: {screen_array.shape}")
                 return np.zeros((144, 160, 3), dtype=np.uint8)
 
-            # Ensure proper data type (uint8)
+            # Ensure proper data type with optimized conversion
             if screen_array.dtype != np.uint8:
-                screen_array = screen_array.astype(np.uint8)
+                screen_array = screen_array.astype(np.uint8, copy=False)
 
-            # Validate final dimensions
-            if screen_array.shape != (144, 160, 3):
-                logger.warning(f"Screen shape {screen_array.shape} doesn't match expected (144, 160, 3)")
-                return np.zeros((144, 160, 3), dtype=np.uint8)
+            # Cache the processed screen
+            if self._screen_cache_enabled and screen_hash:
+                self._screen_cache[screen_hash] = screen_array.copy()
+                # Limit cache size to prevent memory issues
+                if len(self._screen_cache) > 10:
+                    oldest_key = next(iter(self._screen_cache))
+                    del self._screen_cache[oldest_key]
+
+            # Update performance metrics
+            self._update_fps_counter(time.time() - start_time)
 
             return screen_array
 
@@ -314,21 +461,89 @@ finally:
             logger.error(f"Error getting screen from PyBoy: {e}")
             return np.zeros((144, 160, 3), dtype=np.uint8)
 
-    def get_screen_bytes(self) -> bytes:
-        """Get the current screen as bytes for AI processing using proper PyBoy API"""
+    def _calculate_screen_hash(self, screen_array: np.ndarray) -> Optional[str]:
+        """Calculate a fast hash of the screen array for caching"""
         try:
-            # Get screen as numpy array first
+            # Use a small sample of the screen for faster hashing
+            if screen_array.size > 1000:
+                # Sample every 4th pixel for hashing
+                sample = screen_array[::4, ::4].tobytes()
+            else:
+                sample = screen_array.tobytes()
+
+            return hashlib.md5(sample).hexdigest()
+        except Exception:
+            return None
+
+    def _update_fps_counter(self, process_time: float):
+        """Update FPS tracking counter"""
+        current_time = time.time()
+        self._performance_stats['conversion_time'] += process_time
+
+        # Track FPS every second
+        if current_time - self._last_fps_time >= 1.0:
+            if len(self._fps_tracker) > 0:
+                avg_fps = len(self._fps_tracker) / (current_time - self._last_fps_time)
+                self._performance_stats['avg_fps'] = avg_fps
+            self._fps_tracker = []
+            self._last_fps_time = current_time
+
+        self._fps_tracker.append(current_time)
+        self._frame_counter += 1
+
+    def get_performance_stats(self) -> dict:
+        """Get current performance statistics"""
+        return {
+            **self._performance_stats,
+            'cache_enabled': self._screen_cache_enabled,
+            'cache_size': len(self._screen_cache),
+            'frame_count': self._frame_counter,
+            'cv2_available': CV2_AVAILABLE,
+            'pil_available': PIL_AVAILABLE
+        }
+
+    def set_screen_caching(self, enabled: bool):
+        """Enable or disable screen caching"""
+        self._screen_cache_enabled = enabled
+        if not enabled:
+            self._screen_cache.clear()
+        logger.info(f"Screen caching {'enabled' if enabled else 'disabled'}")
+
+    def clear_screen_cache(self):
+        """Clear the screen cache"""
+        self._screen_cache.clear()
+        self._last_screen_hash = None
+        logger.info("Screen cache cleared")
+
+    def get_screen_bytes(self) -> bytes:
+        """Get the current screen as bytes with optimized conversion"""
+        try:
+            start_time = time.time()
+
+            # Get screen as numpy array first (already cached)
             screen_array = self.get_screen()
 
-            # Convert to JPEG bytes
-            import io
-            from PIL import Image
+            # Use OpenCV for faster conversion if available
+            if CV2_AVAILABLE:
+                # OpenCV is much faster for image encoding
+                success, img_buffer = cv2.imencode('.jpg', screen_array, [cv2.IMWRITE_JPEG_QUALITY, 75, cv2.IMWRITE_JPEG_OPTIMIZE, 1])
+                if success:
+                    img_bytes = img_buffer.tobytes()
+                else:
+                    raise RuntimeError("OpenCV encoding failed")
+            elif PIL_AVAILABLE:
+                # Fallback to PIL with optimized settings
+                img_buffer = io.BytesIO()
+                Image.fromarray(screen_array).save(img_buffer, format='JPEG', quality=75, optimize=False, progressive=False)
+                img_bytes = img_buffer.getvalue()
+            else:
+                # Ultimate fallback - raw bytes
+                img_bytes = screen_array.tobytes()
 
-            img_buffer = io.BytesIO()
-            Image.fromarray(screen_array).save(img_buffer, format='JPEG', quality=85, optimize=True)
-            img_bytes = img_buffer.getvalue()
+            conversion_time = time.time() - start_time
+            self._performance_stats['conversion_time'] += conversion_time
 
-            logger.debug(f"Screen converted to bytes: {len(img_bytes)} bytes")
+            logger.debug(f"Screen converted to bytes: {len(img_bytes)} bytes in {conversion_time:.3f}s")
             return img_bytes
 
         except Exception as e:
@@ -793,3 +1008,402 @@ finally:
         except Exception as e:
             logger.error(f"Error capturing screenshot: {e}")
             return False
+
+
+class PyBoyEmulatorMP(EmulatorInterface):
+    """
+    Multi-process version of PyBoy emulator for improved performance and isolation
+    """
+    def __init__(self):
+        self.pyboy_process = None
+        self.command_queue = None
+        self.result_queue = None
+        self.stop_event = None
+        self.initialized = False
+        self.rom_path = None
+        self.game_title = ""
+        self.frame_count = 0
+
+        # Performance attributes
+        self._last_command_time = 0
+        self._command_times = []
+
+    def load_rom(self, rom_path: str) -> bool:
+        """Load a ROM file in a separate process"""
+        if not MP_AVAILABLE:
+            logger.warning("Multi-processing not available, falling back to single process")
+            # Fall back to regular PyBoyEmulator
+            fallback_emulator = PyBoyEmulator()
+            success = fallback_emulator.load_rom(rom_path)
+            if success:
+                # Transfer state to this instance
+                self.pyboy_process = fallback_emulator
+                self.initialized = True
+                self.rom_path = rom_path
+                self.game_title = fallback_emulator.game_title
+            return success
+
+        if not PYBOY_AVAILABLE:
+            raise RuntimeError("PyBoy is not available. Please install it with 'pip install pyboy'")
+
+        if not os.path.exists(rom_path):
+            raise FileNotFoundError(f"ROM file not found: {rom_path}")
+
+        try:
+            logger.info(f"Initializing multi-process PyBoy with ROM: {os.path.basename(rom_path)}")
+
+            # Create communication channels
+            self.command_queue = Queue()
+            self.result_queue = Queue()
+            self.stop_event = Event()
+
+            # Start PyBoy in separate process
+            self.pyboy_process = Process(
+                target=self._pyboy_worker,
+                args=(rom_path, self.command_queue, self.result_queue, self.stop_event),
+                daemon=True
+            )
+            self.pyboy_process.start()
+
+            # Wait for initialization
+            try:
+                result = self.result_queue.get(timeout=10.0)
+                if result.get('status') == 'initialized':
+                    self.initialized = True
+                    self.rom_path = rom_path
+                    self.game_title = result.get('game_title', '')
+                    logger.info(f"Multi-process PyBoy initialized successfully")
+                    return True
+                else:
+                    logger.error(f"Initialization failed: {result.get('error', 'Unknown error')}")
+                    return False
+            except Exception as e:
+                logger.error(f"Timeout waiting for PyBoy initialization: {e}")
+                self._cleanup_process()
+                return False
+
+        except Exception as e:
+            logger.error(f"Error loading ROM in multi-process mode: {e}")
+            return False
+
+    def _pyboy_worker(self, rom_path: str, command_queue: Queue, result_queue: Queue, stop_event: Event):
+        """Worker function that runs PyBoy in a separate process"""
+        try:
+            # Initialize PyBoy in worker process
+            pyboy = PyBoy(
+                rom_path,
+                window="null",
+                scale=2,
+                sound_emulated=False,
+                sound_volume=0
+            )
+            pyboy.set_emulation_speed(0)
+
+            # Signal successful initialization
+            result_queue.put({
+                'status': 'initialized',
+                'game_title': pyboy.cartridge_title
+            })
+
+            # Process commands
+            while not stop_event.is_set():
+                try:
+                    # Wait for command with timeout
+                    try:
+                        command = command_queue.get(timeout=0.1)
+                    except:
+                        continue
+
+                    cmd_type = command.get('type')
+                    cmd_id = command.get('id')
+
+                    if cmd_type == 'step':
+                        action = command.get('action', 'NOOP')
+                        frames = command.get('frames', 1)
+                        success = self._execute_step(pyboy, action, frames)
+                        result_queue.put({'id': cmd_id, 'success': success})
+
+                    elif cmd_type == 'get_screen':
+                        screen_array = self._get_screen_array(pyboy)
+                        result_queue.put({'id': cmd_id, 'screen': screen_array})
+
+                    elif cmd_type == 'get_screen_bytes':
+                        screen_bytes = self._get_screen_bytes_worker(pyboy)
+                        result_queue.put({'id': cmd_id, 'bytes': screen_bytes})
+
+                    elif cmd_type == 'get_memory':
+                        address = command.get('address')
+                        size = command.get('size', 1)
+                        memory_data = self._get_memory_worker(pyboy, address, size)
+                        result_queue.put({'id': cmd_id, 'memory': memory_data})
+
+                    elif cmd_type == 'set_memory':
+                        address = command.get('address')
+                        value = command.get('value')
+                        success = self._set_memory_worker(pyboy, address, value)
+                        result_queue.put({'id': cmd_id, 'success': success})
+
+                    elif cmd_type == 'reset':
+                        success = self._reset_worker(pyboy, rom_path)
+                        result_queue.put({'id': cmd_id, 'success': success})
+
+                    elif cmd_type == 'get_info':
+                        info = self._get_info_worker(pyboy)
+                        result_queue.put({'id': cmd_id, 'info': info})
+
+                    elif cmd_type == 'get_frame_count':
+                        frame_count = pyboy.frame_count if pyboy else 0
+                        result_queue.put({'id': cmd_id, 'frame_count': frame_count})
+
+                    elif cmd_type == 'stop':
+                        break
+
+                except Exception as e:
+                    logger.error(f"Error processing command in worker: {e}")
+                    result_queue.put({'id': cmd_id, 'error': str(e)})
+
+        except Exception as e:
+            logger.error(f"Critical error in PyBoy worker: {e}")
+            result_queue.put({'status': 'error', 'error': str(e)})
+
+        finally:
+            # Clean up PyBoy
+            if 'pyboy' in locals() and pyboy:
+                pyboy.stop()
+
+    def _execute_step(self, pyboy, action: str, frames: int) -> bool:
+        """Execute action in worker process"""
+        action_map = {
+            'UP': 'up', 'DOWN': 'down', 'LEFT': 'left', 'RIGHT': 'right',
+            'A': 'a', 'B': 'b', 'START': 'start', 'SELECT': 'select'
+        }
+
+        try:
+            if action in action_map:
+                button = action_map[action]
+                for i in range(frames):
+                    if i % 2 == 0:
+                        pyboy.button(button)
+                    pyboy.tick(1, i == frames - 1)
+                pyboy.button(button)
+            else:
+                for i in range(frames):
+                    pyboy.tick(1, i == frames - 1)
+            return True
+        except Exception:
+            return False
+
+    def _get_screen_array(self, pyboy) -> np.ndarray:
+        """Get screen array in worker process"""
+        try:
+            screen_array = pyboy.screen.ndarray
+            if screen_array is None or screen_array.size == 0:
+                return np.zeros((144, 160, 3), dtype=np.uint8)
+
+            if len(screen_array.shape) == 3 and screen_array.shape[2] == 4:
+                screen_array = screen_array[:, :, :3]
+
+            if screen_array.dtype != np.uint8:
+                screen_array = screen_array.astype(np.uint8)
+
+            return screen_array
+        except Exception:
+            return np.zeros((144, 160, 3), dtype=np.uint8)
+
+    def _get_screen_bytes_worker(self, pyboy) -> bytes:
+        """Get screen bytes in worker process"""
+        try:
+            screen_array = self._get_screen_array(pyboy)
+            if CV2_AVAILABLE:
+                success, img_buffer = cv2.imencode('.jpg', screen_array, [
+                    cv2.IMWRITE_JPEG_QUALITY, 75,
+                    cv2.IMWRITE_JPEG_OPTIMIZE, 1
+                ])
+                if success:
+                    return img_buffer.tobytes()
+
+            # Fallback to raw bytes
+            return screen_array.tobytes()
+        except Exception:
+            return b''
+
+    def _get_memory_worker(self, pyboy, address: int, size: int) -> bytes:
+        """Get memory in worker process"""
+        try:
+            if size == 1:
+                return bytes([pyboy.memory[address]])
+            else:
+                return bytes(pyboy.memory[address:address + size])
+        except Exception:
+            return b'\x00' * size
+
+    def _set_memory_worker(self, pyboy, address: int, value: bytes) -> bool:
+        """Set memory in worker process"""
+        try:
+            if len(value) == 1:
+                pyboy.memory[address] = value[0]
+            else:
+                pyboy.memory[address:address + len(value)] = list(value)
+            return True
+        except Exception:
+            return False
+
+    def _reset_worker(self, pyboy, rom_path: str) -> bool:
+        """Reset emulator in worker process"""
+        try:
+            pyboy.stop()
+            pyboy = PyBoy(
+                rom_path,
+                window="null",
+                scale=2,
+                sound_emulated=False,
+                sound_volume=0
+            )
+            pyboy.set_emulation_speed(0)
+            pyboy.tick(1, False)
+            return True
+        except Exception:
+            return False
+
+    def _get_info_worker(self, pyboy) -> dict:
+        """Get info in worker process"""
+        try:
+            return {
+                "rom_title": pyboy.cartridge_title,
+                "frame_count": pyboy.frame_count,
+                "initialized": True
+            }
+        except Exception:
+            return {"error": "Failed to get info"}
+
+    def _send_command(self, command_type: str, **kwargs) -> dict:
+        """Send command to worker process and get result"""
+        if not self.initialized or not self.pyboy_process:
+            return {"error": "Emulator not initialized"}
+
+        cmd_id = f"cmd_{int(time.time() * 1000000)}"
+        command = {'type': command_type, 'id': cmd_id, **kwargs}
+
+        try:
+            self.command_queue.put(command)
+            result = self.result_queue.get(timeout=5.0)
+
+            if result.get('id') == cmd_id:
+                return result
+            else:
+                return {"error": "Command ID mismatch"}
+
+        except Exception as e:
+            logger.error(f"Command {command_type} failed: {e}")
+            return {"error": str(e)}
+
+    def step(self, action: str, frames: int = 1) -> bool:
+        """Execute action via multi-process communication"""
+        start_time = time.time()
+        result = self._send_command('step', action=action, frames=frames)
+        self._track_command_time(time.time() - start_time)
+        return result.get('success', False)
+
+    def get_screen(self) -> np.ndarray:
+        """Get screen via multi-process communication"""
+        start_time = time.time()
+        result = self._send_command('get_screen')
+        screen_data = result.get('screen')
+        self._track_command_time(time.time() - start_time)
+
+        if isinstance(screen_data, np.ndarray):
+            return screen_data
+        else:
+            return np.zeros((144, 160, 3), dtype=np.uint8)
+
+    def get_screen_bytes(self) -> bytes:
+        """Get screen bytes via multi-process communication"""
+        start_time = time.time()
+        result = self._send_command('get_screen_bytes')
+        bytes_data = result.get('bytes', b'')
+        self._track_command_time(time.time() - start_time)
+        return bytes_data
+
+    def get_memory(self, address: int, size: int = 1) -> bytes:
+        """Get memory via multi-process communication"""
+        result = self._send_command('get_memory', address=address, size=size)
+        return result.get('memory', b'\x00' * size)
+
+    def set_memory(self, address: int, value: bytes) -> bool:
+        """Set memory via multi-process communication"""
+        result = self._send_command('set_memory', address=address, value=value)
+        return result.get('success', False)
+
+    def reset(self) -> bool:
+        """Reset via multi-process communication"""
+        result = self._send_command('reset')
+        return result.get('success', False)
+
+    def get_info(self) -> dict:
+        """Get info via multi-process communication"""
+        result = self._send_command('get_info')
+        return result.get('info', {"error": "Failed to get info"})
+
+    def get_frame_count(self) -> int:
+        """Get frame count via multi-process communication"""
+        result = self._send_command('get_frame_count')
+        return result.get('frame_count', 0)
+
+    def _track_command_time(self, command_time: float):
+        """Track command execution time for performance monitoring"""
+        self._command_times.append(command_time)
+        if len(self._command_times) > 100:
+            self._command_times.pop(0)
+
+    def _cleanup_process(self):
+        """Clean up the worker process"""
+        if self.stop_event:
+            self.stop_event.set()
+
+        if self.pyboy_process and self.pyboy_process.is_alive():
+            try:
+                self.pyboy_process.join(timeout=2.0)
+                if self.pyboy_process.is_alive():
+                    self.pyboy_process.terminate()
+            except Exception as e:
+                logger.error(f"Error cleaning up process: {e}")
+
+        self.pyboy_process = None
+        self.command_queue = None
+        self.result_queue = None
+        self.stop_event = None
+
+    def cleanup(self) -> bool:
+        """Clean up multi-process resources"""
+        try:
+            logger.info("Cleaning up multi-process PyBoy emulator")
+            self._cleanup_process()
+            self.initialized = False
+            self.rom_path = None
+            self.game_title = ""
+            logger.info("Multi-process PyBoy cleanup completed")
+            return True
+        except Exception as e:
+            logger.error(f"Error during multi-process cleanup: {e}")
+            return False
+
+    def is_running(self) -> bool:
+        """Check if the emulator is running"""
+        return self.initialized and self.pyboy_process and self.pyboy_process.is_alive()
+
+    def get_performance_stats(self) -> dict:
+        """Get performance statistics for multi-process mode"""
+        if not self._command_times:
+            return {"mode": "multi-process", "status": "no_data"}
+
+        avg_command_time = sum(self._command_times) / len(self._command_times)
+        return {
+            "mode": "multi-process",
+            "avg_command_time_ms": round(avg_command_time * 1000, 2),
+            "command_count": len(self._command_times),
+            "process_alive": self.pyboy_process.is_alive() if self.pyboy_process else False,
+            "queue_sizes": {
+                "command_queue": self.command_queue.qsize() if self.command_queue else 0,
+                "result_queue": self.result_queue.qsize() if self.result_queue else 0
+            }
+        }

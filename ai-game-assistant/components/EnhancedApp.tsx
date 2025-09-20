@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import Header from './Header';
 import EmulatorScreen from './EmulatorScreen';
 import Controls from './Controls';
@@ -7,8 +8,13 @@ import CollapsibleSidebar from './CollapsibleSidebar';
 import AIPersonalityAvatar, { AIPersonalityState } from './AIPersonalityAvatar';
 import { PokemonCard, TypeBadge, GameStateDisplay } from './PokemonGameUI';
 import SettingsModal from './SettingsModal';
+import { ErrorBoundary } from './ErrorBoundary';
+import { LoadingStates } from './LoadingStates';
+import { useTheme } from './ThemeProvider';
+import { TouchControls, GestureControls } from './TouchControls';
 import type { EmulatorMode, AIState, GameAction, AILog, AppSettings } from '../types';
 import { EmulatorMode as EmulatorModeEnum, AIState as AIStateEnum } from '../types';
+import { Menu, X, Gamepad2, MessageSquare, Settings, Moon, Sun, Monitor } from 'lucide-react';
 
 const SERVER_URL = 'http://localhost:5000';
 
@@ -21,6 +27,7 @@ interface EnhancedMessage {
 }
 
 const EnhancedApp: React.FC = () => {
+  // Core state
   const [emulatorMode, setEmulatorMode] = useState<EmulatorMode>(EmulatorModeEnum.GB);
   const [romName, setRomName] = useState<string | null>(null);
   const [aiState, setAiState] = useState<AIState>(AIStateEnum.IDLE);
@@ -33,6 +40,8 @@ const EnhancedApp: React.FC = () => {
   const [streamingStatus, setStreamingStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error' | 'failed'>('disconnected');
   const [streamingInfo, setStreamingInfo] = useState<{ fps: number; frameCount: number }>({ fps: 0, frameCount: 0 });
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+
+  // UI state
   const [appSettings, setAppSettings] = useState<AppSettings>(() => {
     const savedSettings = localStorage.getItem('appSettings');
     if (savedSettings) {
@@ -43,6 +52,14 @@ const EnhancedApp: React.FC = () => {
       apiProvider: 'gemini',
     };
   });
+
+  // Mobile and accessibility state
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState<boolean>(false);
+  const [isChatOpen, setIsChatOpen] = useState<boolean>(false);
+  const [activePanel, setActivePanel] = useState<'game' | 'chat'>('game');
+  const [keyboardShortcutsEnabled, setKeyboardShortcutsEnabled] = useState<boolean>(true);
+
+  const { currentTheme, theme, toggleTheme } = useTheme();
 
   // Enhanced state
   const [messages, setMessages] = useState<EnhancedMessage[]>([]);
@@ -60,9 +77,19 @@ const EnhancedApp: React.FC = () => {
   const logIdCounter = useRef<number>(0);
   const messageIdCounter = useRef<number>(0);
 
+  // Theme toggle handler
+  const getThemeIcon = () => {
+    switch (theme) {
+      case 'light': return <Sun className="w-5 h-5" />;
+      case 'dark': return <Moon className="w-5 h-5" />;
+      case 'system': return <Monitor className="w-5 h-5" />;
+      default: return <Monitor className="w-5 h-5" />;
+    }
+  };
+
+  // Handlers
   const handleOpenSettings = () => setIsSettingsOpen(true);
   const handleCloseSettings = () => setIsSettingsOpen(false);
-
   const handleSaveSettings = (newSettings: AppSettings) => {
     setAppSettings(newSettings);
     localStorage.setItem('appSettings', JSON.stringify(newSettings));
@@ -71,6 +98,63 @@ const EnhancedApp: React.FC = () => {
     }
     handleCloseSettings();
   };
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyPress = (event: KeyboardEvent) => {
+      if (!keyboardShortcutsEnabled) return;
+
+      // Toggle chat panel
+      if ((event.ctrlKey || event.metaKey) && event.key === 'c') {
+        event.preventDefault();
+        setIsChatOpen(prev => !prev);
+      }
+
+      // Toggle mobile menu
+      if ((event.ctrlKey || event.metaKey) && event.key === 'm') {
+        event.preventDefault();
+        setIsMobileMenuOpen(prev => !prev);
+      }
+
+      // Toggle theme
+      if ((event.ctrlKey || event.metaKey) && event.key === 't') {
+        event.preventDefault();
+        toggleTheme();
+      }
+
+      // Quick actions
+      if ((event.ctrlKey || event.metaKey) && event.key === 's') {
+        event.preventDefault();
+        aiState === AIStateEnum.IDLE ? startAI() : stopAI();
+      }
+
+      // Escape to close modals
+      if (event.key === 'Escape') {
+        setIsSettingsOpen(false);
+        setIsMobileMenuOpen(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyPress);
+    return () => window.removeEventListener('keydown', handleKeyPress);
+  }, [keyboardShortcutsEnabled, aiState, toggleTheme]);
+
+  // Responsive behavior
+  useEffect(() => {
+    const handleResize = () => {
+      const isMobile = window.innerWidth < 768;
+      if (isMobile && isChatOpen) {
+        setActivePanel('chat');
+      } else if (!isMobile) {
+        setActivePanel('game');
+        setIsChatOpen(true);
+      }
+    };
+
+    handleResize();
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [isChatOpen]);
 
   // Enhanced chat message handling
   const handleSendMessage = useCallback(async (message: string) => {
@@ -186,30 +270,103 @@ const EnhancedApp: React.FC = () => {
     return 'neutral';
   };
 
-  // Sidebar configuration
+  // Enhanced sidebar configuration with mobile support
   const sidebarSections = [
     {
       title: 'Game Controls',
       items: [
-        { id: 'rom', icon: '📁', label: 'Load ROM', onClick: () => {} },
-        { id: 'start', icon: '▶️', label: 'Start AI', onClick: () => aiState === AIStateEnum.IDLE && startAI() },
-        { id: 'stop', icon: '⏹️', label: 'Stop AI', onClick: () => aiState !== AIStateEnum.IDLE && stopAI() },
-        { id: 'reset', icon: '🔄', label: 'Reset Game', onClick: () => {} },
+        {
+          id: 'rom',
+          icon: '📁',
+          label: 'Load ROM',
+          onClick: () => handleRomLoad(new File([], '', { type: 'application/octet-stream' })),
+          description: 'Load a game ROM file',
+          shortcut: 'Ctrl+L'
+        },
+        {
+          id: 'start',
+          icon: '▶️',
+          label: 'Start AI',
+          onClick: () => aiState === AIStateEnum.IDLE && startAI(),
+          description: 'Start AI playing the game',
+          shortcut: 'Ctrl+S',
+          disabled: aiState !== AIStateEnum.IDLE
+        },
+        {
+          id: 'stop',
+          icon: '⏹️',
+          label: 'Stop AI',
+          onClick: () => aiState !== AIStateEnum.IDLE && stopAI(),
+          description: 'Stop AI gameplay',
+          shortcut: 'Ctrl+S',
+          disabled: aiState === AIStateEnum.IDLE
+        },
+        {
+          id: 'reset',
+          icon: '🔄',
+          label: 'Reset Game',
+          onClick: () => {}, // TODO: Implement reset
+          description: 'Reset the current game',
+          shortcut: 'Ctrl+R'
+        },
       ]
     },
     {
       title: 'AI Features',
       items: [
-        { id: 'chat', icon: '💬', label: 'Chat Interface', onClick: () => {} },
-        { id: 'analysis', icon: '🧠', label: 'Game Analysis', onClick: () => {} },
-        { id: 'strategy', icon: '🎯', label: 'Strategy Mode', onClick: () => {} },
-        { id: 'learning', icon: '📚', label: 'Learning Hub', onClick: () => {} },
+        {
+          id: 'chat',
+          icon: '💬',
+          label: 'Chat Interface',
+          onClick: () => setIsChatOpen(true),
+          description: 'Open chat with AI assistant',
+          shortcut: 'Ctrl+C'
+        },
+        {
+          id: 'analysis',
+          icon: '🧠',
+          label: 'Game Analysis',
+          onClick: () => {}, // TODO: Implement analysis
+          description: 'Analyze current game state',
+          shortcut: 'Ctrl+A'
+        },
+        {
+          id: 'strategy',
+          icon: '🎯',
+          label: 'Strategy Mode',
+          onClick: () => {}, // TODO: Implement strategy
+          description: 'Configure AI strategy',
+          shortcut: 'Ctrl+T'
+        },
+        {
+          id: 'learning',
+          icon: '📚',
+          label: 'Learning Hub',
+          onClick: () => {}, // TODO: Implement learning
+          description: 'View AI learning progress',
+          shortcut: 'Ctrl+L'
+        },
       ]
     },
     {
-      title: 'External',
+      title: 'Settings',
       items: [
-        { id: 'discord', icon: '💎', label: 'Discord', onClick: () => {} },
+        {
+          id: 'theme',
+          icon: getThemeIcon(),
+          label: `Theme: ${theme.charAt(0).toUpperCase() + theme.slice(1)}`,
+          onClick: toggleTheme,
+          description: 'Toggle color theme',
+          shortcut: 'Ctrl+T'
+        },
+        {
+          id: 'settings',
+          icon: '⚙️',
+          label: 'Settings',
+          onClick: handleOpenSettings,
+          description: 'Open application settings',
+          shortcut: 'Ctrl+,'
+        },
       ]
     }
   ];
@@ -586,96 +743,347 @@ const EnhancedApp: React.FC = () => {
     }
   }, [aiState]);
 
-  return (
-    <div className="h-screen w-screen flex bg-gray-900 text-white">
-      {/* Enhanced Sidebar */}
-      <CollapsibleSidebar sections={sidebarSections} />
+  // Mobile header component
+  const MobileHeader = () => (
+    <motion.header
+      className="sticky top-0 z-40 bg-gray-900 border-b border-gray-800 px-4 py-3"
+      initial={{ y: -100 }}
+      animate={{ y: 0 }}
+      transition={{ duration: 0.3 }}
+    >
+      <div className="flex items-center justify-between">
+        <div className="flex items-center space-x-3">
+          <button
+            onClick={() => setIsMobileMenuOpen(true)}
+            className="p-2 rounded-lg hover:bg-gray-800 touch-target"
+            aria-label="Open menu"
+          >
+            <Menu className="w-6 h-6" />
+          </button>
+          <h1 className="text-xl font-bold text-cyan-glow">AI Game Assistant</h1>
+        </div>
 
-      {/* Main Content */}
-      <div className="flex-1 flex flex-col">
-        <Header
-          emulatorMode={emulatorMode}
-          onModeChange={setEmulatorMode}
-          onOpenSettings={handleOpenSettings}
-        />
+        <div className="flex items-center space-x-2">
+          <button
+            onClick={() => setActivePanel(activePanel === 'game' ? 'chat' : 'game')}
+            className="p-2 rounded-lg hover:bg-gray-800 touch-target"
+            aria-label={activePanel === 'game' ? 'Switch to chat' : 'Switch to game'}
+          >
+            {activePanel === 'game' ? <MessageSquare className="w-5 h-5" /> : <Gamepad2 className="w-5 h-5" />}
+          </button>
 
-        <div className="flex-1 flex overflow-hidden">
-          {/* Game Area */}
-          <div className="flex-1 flex flex-col p-4">
-            <div className="h-full flex flex-col bg-gray-800 rounded-lg shadow-xl">
-              {/* Game Stats Bar */}
-              <div className="p-4 border-b border-gray-700">
-                <GameStateDisplay
-                  step={gameStats.step}
-                  location={gameStats.location}
-                  isPlaying={aiState === AIStateEnum.RUNNING}
-                />
-              </div>
-
-              {/* Emulator Screen */}
-              <div className="flex-1 p-4">
-                <EmulatorScreen
-                  emulatorMode={emulatorMode}
-                  romName={romName}
-                  onRomLoad={() => {}}
-                  aiState={aiState}
-                  screenImage={screenImage}
-                  streamingStatus={streamingStatus}
-                  streamingInfo={streamingInfo}
-                />
-              </div>
-
-              {/* Controls */}
-              <div className="p-4 border-t border-gray-700">
-                <Controls lastAction={lastAIAction} />
-              </div>
-            </div>
-          </div>
-
-          {/* Right Panel - Enhanced Chat */}
-          <div className="w-96 bg-gray-900 border-l border-gray-800 flex flex-col">
-            {/* AI Personality Header */}
-            <div className="p-4 border-b border-gray-800">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <AIPersonalityAvatar state={aiPersonality} size="md" />
-                  <div>
-                    <h3 className="font-semibold">AI Assistant</h3>
-                    <p className="text-sm text-gray-400 capitalize">{aiPersonality}</p>
-                  </div>
-                </div>
-                <div className="text-right">
-                  <div className="text-xs text-gray-500">Status</div>
-                  <div className="text-sm font-medium">
-                    {aiState === AIStateEnum.RUNNING ? '🟢 Playing' :
-                     aiState === AIStateEnum.THINKING ? '🟡 Thinking' :
-                     aiState === AIStateEnum.ERROR ? '🔴 Error' : '⚪ Idle'}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Enhanced Chat Interface */}
-            <EnhancedChatInterface
-              messages={messages}
-              onSendMessage={handleSendMessage}
-              gameState={{
-                step: gameStats.step,
-                location: gameStats.location,
-                isPlaying: aiState === AIStateEnum.RUNNING
-              }}
-            />
-          </div>
+          <button
+            onClick={toggleTheme}
+            className="p-2 rounded-lg hover:bg-gray-800 touch-target"
+            aria-label="Toggle theme"
+          >
+            {getThemeIcon()}
+          </button>
         </div>
       </div>
+    </motion.header>
+  );
 
-      <SettingsModal
-        isOpen={isSettingsOpen}
-        onClose={handleCloseSettings}
-        currentSettings={appSettings}
-        onSave={handleSaveSettings}
-      />
-    </div>
+  // Mobile navigation panel
+  const MobileNav = () => (
+    <AnimatePresence>
+      {isMobileMenuOpen && (
+        <>
+          <motion.div
+            className="fixed inset-0 bg-black/50 z-50 md:hidden"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setIsMobileMenuOpen(false)}
+          />
+          <motion.div
+            className="fixed left-0 top-0 h-full w-80 bg-gray-800 z-50 md:hidden overflow-y-auto"
+            initial={{ x: '-100%' }}
+            animate={{ x: 0 }}
+            exit={{ x: '-100%' }}
+            transition={{ type: 'spring', damping: 25 }}
+          >
+            <div className="p-4 border-b border-gray-700">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold">Menu</h2>
+                <button
+                  onClick={() => setIsMobileMenuOpen(false)}
+                  className="p-2 rounded-lg hover:bg-gray-700"
+                  aria-label="Close menu"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-4 space-y-6">
+              {sidebarSections.map((section, index) => (
+                <div key={index}>
+                  <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
+                    {section.title}
+                  </h3>
+                  <div className="space-y-2">
+                    {section.items.map((item, itemIndex) => (
+                      <button
+                        key={itemIndex}
+                        onClick={() => {
+                          item.onClick();
+                          setIsMobileMenuOpen(false);
+                        }}
+                        disabled={item.disabled}
+                        className="w-full flex items-center space-x-3 p-3 rounded-lg hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed text-left transition-colors"
+                      >
+                        <span className="text-lg">{item.icon}</span>
+                        <div className="flex-1">
+                          <div className="font-medium">{item.label}</div>
+                          <div className="text-xs text-gray-400">{item.description}</div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
+  );
+
+  return (
+    <ErrorBoundary>
+      <div className="h-screen w-screen flex bg-gray-900 text-white overflow-hidden">
+        {/* Desktop Sidebar */}
+        <div className="hidden md:flex">
+          <CollapsibleSidebar sections={sidebarSections} />
+        </div>
+
+        {/* Mobile Navigation */}
+        <MobileNav />
+
+        {/* Main Content */}
+        <div className="flex-1 flex flex-col min-w-0">
+          {/* Desktop Header */}
+          <div className="hidden md:block">
+            <Header
+              emulatorMode={emulatorMode}
+              onModeChange={setEmulatorMode}
+              onOpenSettings={handleOpenSettings}
+            />
+          </div>
+
+          {/* Mobile Header */}
+          <div className="md:hidden">
+            <MobileHeader />
+          </div>
+
+          {/* Main Content Area */}
+          <div className="flex-1 flex overflow-hidden">
+            {/* Desktop Layout */}
+            <div className="hidden md:flex flex-1 overflow-hidden">
+              {/* Game Area */}
+              <div className="flex-1 flex flex-col p-4">
+                <motion.div
+                  className="h-full flex flex-col bg-gray-800 rounded-lg shadow-xl"
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  transition={{ duration: 0.3 }}
+                >
+                  {/* Game Stats Bar */}
+                  <div className="p-4 border-b border-gray-700">
+                    <GameStateDisplay
+                      step={gameStats.step}
+                      location={gameStats.location}
+                      isPlaying={aiState === AIStateEnum.RUNNING}
+                    />
+                  </div>
+
+                  {/* Emulator Screen */}
+                  <div className="flex-1 p-4">
+                    <EmulatorScreen
+                      emulatorMode={emulatorMode}
+                      romName={romName}
+                      onRomLoad={() => {}}
+                      aiState={aiState}
+                      screenImage={screenImage}
+                      streamingStatus={streamingStatus}
+                      streamingInfo={streamingInfo}
+                    />
+                  </div>
+
+                  {/* Controls */}
+                  <div className="p-4 border-t border-gray-700">
+                    <Controls lastAction={lastAIAction} />
+                  </div>
+                </motion.div>
+              </div>
+
+              {/* Right Panel - Enhanced Chat */}
+              <div className="w-96 bg-gray-900 border-l border-gray-800 flex flex-col">
+                {/* AI Personality Header */}
+                <div className="p-4 border-b border-gray-800">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <AIPersonalityAvatar state={aiPersonality} size="md" />
+                      <div>
+                        <h3 className="font-semibold">AI Assistant</h3>
+                        <p className="text-sm text-gray-400 capitalize">{aiPersonality}</p>
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-xs text-gray-500">Status</div>
+                      <div className="text-sm font-medium">
+                        {aiState === AIStateEnum.RUNNING ? '🟢 Playing' :
+                         aiState === AIStateEnum.THINKING ? '🟡 Thinking' :
+                         aiState === AIStateEnum.ERROR ? '🔴 Error' : '⚪ Idle'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Enhanced Chat Interface */}
+                <EnhancedChatInterface
+                  messages={messages}
+                  onSendMessage={handleSendMessage}
+                  gameState={{
+                    step: gameStats.step,
+                    location: gameStats.location,
+                    isPlaying: aiState === AIStateEnum.RUNNING
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* Mobile Layout */}
+            <div className="md:hidden flex-1 overflow-hidden">
+              <AnimatePresence mode="wait">
+                <motion.div
+                  key={activePanel}
+                  className="h-full flex flex-col"
+                  initial={{ x: activePanel === 'game' ? -100 : 100, opacity: 0 }}
+                  animate={{ x: 0, opacity: 1 }}
+                  exit={{ x: activePanel === 'game' ? -100 : 100, opacity: 0 }}
+                  transition={{ duration: 0.2 }}
+                >
+                  {activePanel === 'game' ? (
+                    // Mobile Game Panel
+                    <div className="flex-1 flex flex-col p-4">
+                      <div className="h-full flex flex-col bg-gray-800 rounded-lg shadow-xl">
+                        {/* Game Stats Bar */}
+                        <div className="p-4 border-b border-gray-700">
+                          <GameStateDisplay
+                            step={gameStats.step}
+                            location={gameStats.location}
+                            isPlaying={aiState === AIStateEnum.RUNNING}
+                          />
+                        </div>
+
+                        {/* Emulator Screen */}
+                        <div className="flex-1 p-4">
+                          <EmulatorScreen
+                            emulatorMode={emulatorMode}
+                            romName={romName}
+                            onRomLoad={() => {}}
+                            aiState={aiState}
+                            screenImage={screenImage}
+                            streamingStatus={streamingStatus}
+                            streamingInfo={streamingInfo}
+                          />
+                        </div>
+
+                        {/* Controls */}
+                        <div className="p-4 border-t border-gray-700">
+                          <Controls lastAction={lastAIAction} />
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    // Mobile Chat Panel
+                    <div className="flex-1 flex flex-col bg-gray-900">
+                      {/* AI Personality Header */}
+                      <div className="p-4 border-b border-gray-800">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-3">
+                            <AIPersonalityAvatar state={aiPersonality} size="md" />
+                            <div>
+                              <h3 className="font-semibold">AI Assistant</h3>
+                              <p className="text-sm text-gray-400 capitalize">{aiPersonality}</p>
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-xs text-gray-500">Status</div>
+                            <div className="text-sm font-medium">
+                              {aiState === AIStateEnum.RUNNING ? '🟢 Playing' :
+                               aiState === AIStateEnum.THINKING ? '🟡 Thinking' :
+                               aiState === AIStateEnum.ERROR ? '🔴 Error' : '⚪ Idle'}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Enhanced Chat Interface */}
+                      <div className="flex-1 overflow-hidden">
+                        <EnhancedChatInterface
+                          messages={messages}
+                          onSendMessage={handleSendMessage}
+                          gameState={{
+                            step: gameStats.step,
+                            location: gameStats.location,
+                            isPlaying: aiState === AIStateEnum.RUNNING
+                          }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </motion.div>
+              </AnimatePresence>
+            </div>
+          </div>
+        </div>
+
+        {/* Settings Modal */}
+        <SettingsModal
+          isOpen={isSettingsOpen}
+          onClose={handleCloseSettings}
+          currentSettings={appSettings}
+          onSave={handleSaveSettings}
+        />
+
+        {/* Touch Controls */}
+        <TouchControls
+          onAction={executeAction}
+          disabled={!romName}
+        />
+
+        {/* Gesture Controls */}
+        <GestureControls
+          onSwipe={(direction) => {
+            // Handle swipe gestures for quick actions
+            switch (direction) {
+              case 'left':
+                setActivePanel('chat');
+                break;
+              case 'right':
+                setActivePanel('game');
+                break;
+              case 'up':
+                // Quick action
+                executeAction('UP');
+                break;
+              case 'down':
+                // Quick action
+                executeAction('DOWN');
+                break;
+            }
+          }}
+          onDoubleTap={() => {
+            // Double tap to toggle AI
+            aiState === AIStateEnum.IDLE ? startAI() : stopAI();
+          }}
+          disabled={!romName}
+        />
+      </div>
+    </ErrorBoundary>
   );
 };
 

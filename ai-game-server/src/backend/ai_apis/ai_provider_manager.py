@@ -448,5 +448,26 @@ class AIProviderManager:
                     info['error'] = str(e)
         self.logger.info("Provider status refresh complete")
 
+    def cleanup(self):
+        """Clean up all provider resources"""
+        self.logger.info("Cleaning up AI provider manager...")
+        for name, info in self.providers.items():
+            if info['connector']:
+                try:
+                    # Call cleanup method if it exists
+                    if hasattr(info['connector'], 'cleanup'):
+                        info['connector'].cleanup()
+                    # Clear references
+                    info['connector'] = None
+                    self.logger.debug(f"Cleaned up {name} provider")
+                except Exception as e:
+                    self.logger.error(f"Error cleaning up {name} provider: {e}")
+
+        # Clear all provider references
+        self.providers.clear()
+        self.provider_order.clear()
+        self.fallback_providers.clear()
+        self.logger.info("AI provider manager cleanup complete")
+
 # Global instance
 ai_provider_manager = AIProviderManager()

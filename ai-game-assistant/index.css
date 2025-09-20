@@ -11,17 +11,27 @@ html, body {
   height: 100%;
   width: 100%;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 body {
   font-family: 'Inter', sans-serif;
   background-color: #101014;
   color: #f3f4f6;
+  touch-action: manipulation;
 }
 
 #root {
   height: 100%;
   width: 100%;
+}
+
+/* Viewport height fix for mobile browsers */
+@supports (height: 100dvh) {
+  html, body {
+    height: 100dvh;
+  }
 }
 
 /* Custom scrollbar styling */
@@ -99,5 +109,127 @@ input:focus, textarea:focus, select:focus {
 @media (max-width: 768px) {
   .scrollbar-thin {
     scrollbar-width: thin;
+  }
+
+  /* Mobile-optimized touch targets */
+  .touch-target {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* Mobile-safe font sizes */
+  .mobile-text {
+    font-size: 16px; /* Prevents iOS zoom on input focus */
+  }
+}
+
+/* Tablet responsive */
+@media (max-width: 1024px) {
+  .tablet-layout {
+    flex-direction: column;
+  }
+
+  .tablet-full-width {
+    width: 100% !important;
+  }
+}
+
+/* Mobile responsive */
+@media (max-width: 768px) {
+  .mobile-layout {
+    flex-direction: column;
+  }
+
+  .mobile-full-width {
+    width: 100% !important;
+  }
+
+  .mobile-hidden {
+    display: none !important;
+  }
+
+  .mobile-block {
+    display: block !important;
+  }
+
+  .mobile-text-center {
+    text-align: center;
+  }
+}
+
+/* Large mobile */
+@media (max-width: 480px) {
+  .sm-mobile-layout {
+    flex-direction: column;
+  }
+
+  .sm-mobile-full-width {
+    width: 100% !important;
+  }
+
+  .sm-mobile-text-sm {
+    font-size: 14px;
+  }
+}
+
+/* Loading skeleton animation */
+@keyframes skeleton-loading {
+  0% {
+    background-position: -200px 0;
+  }
+  100% {
+    background-position: calc(200px + 100%) 0;
+  }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    #1a1a1e 25%,
+    #2a2a2e 50%,
+    #1a1a1e 75%
+  );
+  background-size: 200px 100%;
+  animation: skeleton-loading 1.5s ease-in-out infinite;
+}
+
+/* Smooth transitions for theme changes */
+* {
+  transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+}
+
+/* Improved focus styles for accessibility */
+:focus-visible {
+  outline: 2px solid #00f6ff;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px rgba(0, 246, 255, 0.1);
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+  :root {
+    --border-width: 2px;
+  }
+
+  .border-custom {
+    border-width: var(--border-width);
+  }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Print styles */
+@media print {
+  .no-print {
+    display: none !important;
   }
 }
