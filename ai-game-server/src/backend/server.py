@@ -284,6 +284,85 @@ def load_tetris_model():
             'error': str(e)
         }), 500
 
+@app.route('/api/screen', methods=['GET'])
+def get_screen():
+    """Get the current screen from the active emulator"""
+    try:
+        if not game_state["rom_loaded"] or not game_state["active_emulator"]:
+            return jsonify({"error": "No ROM loaded"}), 400
+
+        emulator = emulators[game_state["active_emulator"]]
+
+        # Get screen array
+        screen_array = emulator.get_screen()
+
+        # Validate screen data - don't use placeholders
+        if screen_array is None or screen_array.size == 0:
+            logger.error("Screen data is None or empty")
+            return jsonify({"error": "Failed to capture screen"}), 500
+
+        # Convert to base64
+        img_base64 = numpy_to_base64_image(screen_array)
+        if not img_base64:
+            logger.error("Failed to convert screen to base64")
+            return jsonify({"error": "Failed to process screen image"}), 500
+
+        return jsonify({
+            "image": img_base64,
+            "shape": screen_array.shape,
+            "timestamp": time.time(),
+            "pyboy_frame": emulator.get_frame_count() if hasattr(emulator, 'get_frame_count') else None
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error getting screen: {e}", exc_info=True)
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
+@app.route('/api/screen/debug', methods=['GET'])
+def get_screen_debug():
+    """Debug endpoint to test screen capture functionality"""
+    try:
+        if not game_state["rom_loaded"] or not game_state["active_emulator"]:
+            return jsonify({"error": "No ROM loaded"}), 400
+
+        emulator = emulators[game_state["active_emulator"]]
+
+        # Get emulator info
+        info = emulator.get_info() if hasattr(emulator, 'get_info') else {}
+
+        # Get screen array
+        screen_array = emulator.get_screen()
+
+        debug_info = {
+            "emulator_info": info,
+            "screen_shape": screen_array.shape if screen_array is not None else None,
+            "screen_dtype": str(screen_array.dtype) if screen_array is not None else None,
+            "screen_min": int(screen_array.min()) if screen_array is not None else None,
+            "screen_max": int(screen_array.max()) if screen_array is not None else None,
+            "screen_size": screen_array.size if screen_array is not None else None,
+            "timestamp": time.time(),
+            "emulator_type": game_state["active_emulator"],
+            "rom_loaded": game_state["rom_loaded"],
+            "rom_path": game_state["rom_path"]
+        }
+
+        # Try base64 conversion
+        if screen_array is not None and screen_array.size > 0:
+            img_base64 = numpy_to_base64_image(screen_array)
+            debug_info["base64_success"] = img_base64 is not None and len(img_base64) > 0
+            debug_info["base64_length"] = len(img_base64) if img_base64 else 0
+            debug_info["base64_preview"] = img_base64[:100] + "..." if img_base64 and len(img_base64) > 100 else img_base64
+        else:
+            debug_info["base64_success"] = False
+            debug_info["base64_length"] = 0
+            debug_info["base64_preview"] = None
+
+        return jsonify(debug_info), 200
+
+    except Exception as e:
+        logger.error(f"Error in debug screen endpoint: {e}", exc_info=True)
+        return jsonify({"error": f"Debug endpoint error: {str(e)}"}), 500
+
 @app.route('/api/stream', methods=['GET'])
 def stream_screen():
     """SSE endpoint for live screen streaming with stability fixes"""
@@ -348,22 +427,92 @@ def stream_screen():
                                     raise TimeoutError(f"Too many PyBoy timeouts: {pyboy_timeout_count}")
                                 raise TimeoutError("PyBoy step timeout")
 
+                            # Re-check ROM loaded state before proceeding
+                            if not game_state["rom_loaded"] or not game_state["active_emulator"]:
+                                logger.warning("Stream aborted: ROM no longer loaded")
+                                error_data = {
+                                    'heartbeat': True,
+                                    'frame': frame_count,
+                                    'timestamp': current_time,
+                                    'fps': target_fps,
+                                    'status': 'rom_unloaded',
+                                    'message': 'ROM is no longer loaded',
+                                    'error': 'No ROM loaded'
+                                }
+                                yield f"data: {json.dumps(error_data)}\n\n"
+                                break
+
                             screen_timeout = 0.05 if pyboy_timeout_count == 0 else 0.1
                             try:
                                 screen_array = executor.submit(get_screen).result(timeout=screen_timeout)
                             except FutureTimeoutError:
-                                logger.warning(f"PyBoy get_screen timeout (count: {pyboy_timeout_count}), using placeholder")
-                                screen_array = np.zeros((144, 160, 3), dtype=np.uint8)
+                                pyboy_timeout_count += 1
+                                logger.warning(f"PyBoy get_screen timeout (count: {pyboy_timeout_count})")
 
-                            # Validate screen data - if invalid, use placeholder
+                                # Instead of using placeholder, send error heartbeat
+                                if pyboy_timeout_count >= max_pyboy_timeouts:
+                                    error_data = {
+                                        'heartbeat': True,
+                                        'frame': frame_count,
+                                        'timestamp': current_time,
+                                        'fps': target_fps,
+                                        'status': 'pyboy_timeout',
+                                        'message': 'PyBoy timeout threshold reached',
+                                        'error': 'PyBoy API timeout',
+                                        'timeout_count': pyboy_timeout_count
+                                    }
+                                    yield f"data: {json.dumps(error_data)}\n\n"
+                                    break
+                                else:
+                                    # Send timeout error but continue streaming
+                                    error_data = {
+                                        'heartbeat': True,
+                                        'frame': frame_count,
+                                        'timestamp': current_time,
+                                        'fps': target_fps,
+                                        'status': 'timeout_error',
+                                        'message': 'PyBoy get_screen timeout',
+                                        'error': 'Screen capture timeout',
+                                        'timeout_count': pyboy_timeout_count
+                                    }
+                                    yield f"data: {json.dumps(error_data)}\n\n"
+                                    frame_count += 1
+                                    last_frame_time = current_time
+                                    continue
+
+                            # Validate screen data - if invalid, send error instead of placeholder
                             if screen_array is None or screen_array.size == 0:
-                                screen_array = np.zeros((144, 160, 3), dtype=np.uint8)
-                                logger.warning(f"Stream frame {frame_count}: Using placeholder screen (PyBoy API returned empty)")
+                                logger.warning(f"Stream frame {frame_count}: PyBoy API returned empty screen")
+                                error_data = {
+                                    'heartbeat': True,
+                                    'frame': frame_count,
+                                    'timestamp': current_time,
+                                    'fps': target_fps,
+                                    'status': 'empty_screen',
+                                    'message': 'Screen data is empty',
+                                    'error': 'Screen capture failed'
+                                }
+                                yield f"data: {json.dumps(error_data)}\n\n"
+                                frame_count += 1
+                                last_frame_time = current_time
+                                continue
 
                             # Additional validation for proper PyBoy format
                             if len(screen_array.shape) != 3 or screen_array.shape[2] not in [3, 4]:
-                                logger.warning(f"Stream frame {frame_count}: Invalid shape {screen_array.shape}, correcting")
-                                screen_array = np.zeros((144, 160, 3), dtype=np.uint8)
+                                logger.warning(f"Stream frame {frame_count}: Invalid shape {screen_array.shape}")
+                                error_data = {
+                                    'heartbeat': True,
+                                    'frame': frame_count,
+                                    'timestamp': current_time,
+                                    'fps': target_fps,
+                                    'status': 'invalid_format',
+                                    'message': 'Invalid screen format',
+                                    'error': f'Invalid screen shape: {screen_array.shape}'
+                                }
+                                yield f"data: {json.dumps(error_data)}\n\n"
+                                frame_count += 1
+                                last_frame_time = current_time
+                                continue
 
                             # Convert to base64 using timeout-protected function
                             def convert_image():
