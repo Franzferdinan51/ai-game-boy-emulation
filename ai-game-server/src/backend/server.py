@@ -76,6 +76,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Create Flask app
+app = Flask(__name__)
+
+# Configure CORS with permissive settings for development
+CORS(app, resources={
+    r"/*": {
+        "origins": ["*"],  # Allow all origins for development
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
+    }
+})
+
 # Combined security middleware
 @app.before_request
 def security_middleware():
@@ -217,8 +229,8 @@ def validate_string_input(value: str, field_name: str, min_length: int = 0, max_
     # Check for potential SQL injection patterns
     sql_patterns = ["'", '"', ';', '--', '/*', '*/', 'xp_', 'exec(', 'union ', 'select ', 'insert ', 'update ', 'delete ']
     value_lower = value.lower()
-    for pattern in sql_patterns:
-        if pattern in value_lower:
+    for sql_pattern in sql_patterns:
+        if sql_pattern in value_lower:
             raise ValueError(f"{field_name} contains potentially dangerous characters")
 
     # Check for path traversal attempts
@@ -227,8 +239,8 @@ def validate_string_input(value: str, field_name: str, min_length: int = 0, max_
 
     # Check for command injection patterns
     cmd_patterns = ['|', '&', ';', '`', '$(', '&&', '||', '>', '<', '>>']
-    for pattern in cmd_patterns:
-        if pattern in value:
+    for cmd_pattern in cmd_patterns:
+        if cmd_pattern in value:
             raise ValueError(f"{field_name} contains command injection patterns")
 
     # Custom character validation
@@ -718,19 +730,6 @@ def get_performance_stats() -> dict:
         'torch_cuda_available': TORCH_AVAILABLE and torch.cuda.is_available() if TORCH_AVAILABLE else False
     }
 
-# Create Flask app
-app = Flask(__name__)
-
-# Configure CORS with specific settings for frontend
-CORS(app, resources={
-    r"/*": {
-        "origins": ["http://localhost:5173", "http://localhost:5174", "http://localhost:5175", "http://localhost:5176", "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://127.0.0.1:5175", "http://127.0.0.1:5176"],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
-        "max_age": 86400,
-        "send_wildcard": False
-    }
-})
 
 # Global error handlers
 @app.errorhandler(400)
@@ -872,7 +871,8 @@ def upload_rom():
                 min_length=2,
                 max_length=10,
                 pattern=r'^(true|false)$'
-            ).lower() == 'true'
+            )
+            launch_ui = launch_ui.lower() == 'true'
         except ValueError as e:
             return jsonify({"error": f"Invalid launch_ui parameter: {str(e)}"}), 400
 
@@ -894,11 +894,23 @@ def upload_rom():
 
         logger.info(f"ROM saved to temporary path: {temp_rom_path}")
 
-        # Final emulator validation
-        if emulator_type not in emulators:
+        # Map frontend emulator types to backend emulator keys
+        emulator_type_mapping = {
+            'gb': 'pyboy',
+            'gba': 'pygba',
+            'pyboy': 'pyboy',
+            'pygba': 'pygba'
+        }
+
+        # Map the emulator type
+        mapped_emulator_type = emulator_type_mapping.get(emulator_type)
+        if not mapped_emulator_type or mapped_emulator_type not in emulators:
             logger.error(f"Invalid emulator type: {emulator_type}")
             os.unlink(temp_rom_path)
-            return jsonify({"error": f"Invalid emulator type. Available: {list(emulators.keys())}"}), 400
+            return jsonify({"error": f"Invalid emulator type. Available: {list(emulator_type_mapping.keys())}"}), 400
+
+        # Use the mapped emulator type
+        emulator_type = mapped_emulator_type
 
         logger.info(f"Loading ROM into {emulator_type} emulator...")
         success = emulators[emulator_type].load_rom(temp_rom_path)
