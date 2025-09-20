@@ -1,0 +1,103 @@
+/* AI Game Assistant - Main Stylesheet */
+
+/* Base styles and resets */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: #101014;
+  color: #f3f4f6;
+}
+
+#root {
+  height: 100%;
+  width: 100%;
+}
+
+/* Custom scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1a1a1e;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #4a5568;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #718096;
+}
+
+/* Utility classes */
+.text-cyan-glow {
+  color: #00f6ff;
+  text-shadow: 0 0 10px rgba(0, 246, 255, 0.5);
+}
+
+.text-green-glow {
+  color: #00ff87;
+  text-shadow: 0 0 10px rgba(0, 255, 135, 0.5);
+}
+
+/* Animation utilities */
+@keyframes pulse-glow {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Focus styles */
+*:focus {
+  outline: 2px solid #00f6ff;
+  outline-offset: 2px;
+}
+
+/* Button transitions */
+button {
+  transition: all 0.2s ease-in-out;
+}
+
+/* Input focus styles */
+input:focus, textarea:focus, select:focus {
+  box-shadow: 0 0 0 3px rgba(0, 246, 255, 0.1);
+}
+
+/* Loading spinner animation */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+/* Responsive utilities */
+@media (max-width: 768px) {
+  .scrollbar-thin {
+    scrollbar-width: thin;
+  }
+}
