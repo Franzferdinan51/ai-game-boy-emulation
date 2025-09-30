@@ -1,772 +1,640 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import Header from './components/Header';
-import EmulatorScreen from './components/EmulatorScreen';
-import Controls from './components/Controls';
 import AIPanel from './components/AIPanel';
-import EnhancedChatInterface from './components/EnhancedChatInterface';
-import CollapsibleSidebar from './components/CollapsibleSidebar';
-import AIPersonalityAvatar, { AIPersonalityState } from './components/AIPersonalityAvatar';
-import { GameStateDisplay } from './components/PokemonGameUI';
+import GamePanel from './components/GamePanel';
+import StatePanel from './components/StatePanel';
 import SettingsModal from './components/SettingsModal';
-import type { EmulatorMode, AIState, GameAction, AILog, ChatMessage, AppSettings } from './types';
-import { EmulatorMode as EmulatorModeEnum, AIState as AIStateEnum } from './types';
+import { ErrorBoundary } from './components/ErrorBoundary';
+// FIX: Added PlayerStats to the import list to resolve "Cannot find name" error.
+import type { Achievement, PartyMember, Objective, Item, GameAction, AIState, AILog, ChatMessage, AppSettings, AiModel, PlayerStats, MapData } from './types';
+import { AIState as AIStateEnum } from './types';
+import { fetchAvailableModels, getAIThoughtAndAction, getChatResponse } from './services/geminiService';
+import { getScreen, sendAction, loadRom, saveState as saveGameState, loadState as loadGameState, checkBackendStatus } from './services/backendService';
+import { configService } from './services/configService';
+import { useInterval } from './hooks/useInterval';
 
-const SERVER_URL = 'http://localhost:5000';
+const SAVE_KEY = 'ai-game-assistant-save-v1';
+const STREAM_INTERVAL_MS = 250; // approx 4 FPS for the screen stream
+const IDLE_STATE_REFRESH_MS = 2000;
 
 const App: React.FC = () => {
-  const [emulatorMode, setEmulatorMode] = useState<EmulatorMode>(EmulatorModeEnum.GB);
-  const [romName, setRomName] = useState<string | null>(null);
   const [aiState, setAiState] = useState<AIState>(AIStateEnum.IDLE);
-  const [aiGoal, setAiGoal] = useState<string>('');
-  const [aiLogs, setAiLogs] = useState<AILog[]>([]);
-  const [lastAIAction, setLastAIAction] = useState<GameAction | null>(null);
-  const [screenImage, setScreenImage] = useState<string>('');
-  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
-  const [chatInput, setChatInput] = useState<string>('');
-  const [isChatting, setIsChatting] = useState<boolean>(false);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [eventSource, setEventSource] = useState<EventSource | null>(null);
-  const [streamingStatus, setStreamingStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error' | 'failed'>('disconnected');
-  const [streamingInfo, setStreamingInfo] = useState<{ fps: number; frameCount: number }>({ fps: 0, frameCount: 0 });
-  const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
-  const [appSettings, setAppSettings] = useState<AppSettings>(() => {
-    const savedSettings = localStorage.getItem('appSettings');
-    if (savedSettings) {
-      return JSON.parse(savedSettings);
-    }
-    return {
-      aiActionInterval: 5000,
-      apiProvider: 'gemini',
-    };
-  });
-
-  // Enhanced state for new features
-  const [useEnhancedUI, setUseEnhancedUI] = useState<boolean>(true);
-
-  // Toggle for enhanced UI
-  const toggleEnhancedUI = useCallback(() => {
-    setUseEnhancedUI(prev => !prev);
-  }, []);
-  const [aiPersonality, setAiPersonality] = useState<AIPersonalityState>('neutral');
-  const [gameStats, setGameStats] = useState({
-    step: 0,
-    location: 'Unknown',
-    isPlaying: false
-  });
-  const [enhancedMessages, setEnhancedMessages] = useState<Array<{
-    id: string;
-    role: 'user' | 'ai';
-    content: string;
-    timestamp?: Date;
-    aiState?: AIPersonalityState;
-  }>>([]);
-
+  const [gameScreenUrl, setGameScreenUrl] = useState<string | null>(null);
+  const [actionHistory, setActionHistory] = useState<GameAction[]>([]);
+  const [isRomLoaded, setIsRomLoaded] = useState(false);
   
-  const gameLoopRef = useRef<number | null>(null);
-  const actionHistoryRef = useRef<string[]>([]);
-  const logIdCounter = useRef<number>(0);
-  const chatIdCounter = useRef<number>(0);
-  const enhancedMessageIdCounter = useRef<number>(0);
+  // Dynamic Game State
+  const [party, setParty] = useState<PartyMember[]>([]);
+  const [mapInfo, setMapInfo] = useState<MapData>({ name: 'Loading...', coords: [0, 0], pointsOfInterest: []});
+  const [achievements, setAchievements] = useState<Achievement[]>([]);
+  const [objectives, setObjectives] = useState<Objective[]>([
+    { id: 1, text: 'Complete the tutorial quest', completed: false },
+    { id: 2, text: 'Visit the capital city', completed: false },
+    { id: 3, text: 'Find the hidden ancient ruins', completed: false },
+  ]);
+  const [inventory, setInventory] = useState<Item[]>([]);
+  const [playerStats, setPlayerStats] = useState<PlayerStats>({ runtime: '00:00:00', steps: 0, money: 0 });
+  const [dialogue, setDialogue] = useState('');
+  
+  // State for AIPanel
+  const [aiGoal, setAiGoal] = useState<string>('Defeat the final boss and save the world.');
+  const [currentReasoning, setCurrentReasoning] = useState<string>('Please load a ROM to begin.');
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatting, setIsChatting] = useState(false);
+  
+  // State for Settings
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [appSettings, setAppSettings] = useState<AppSettings>({
+    aiActionInterval: 4000,
+    backendUrl: 'http://localhost:5000',
+    aiProvider: 'google',
+    googleApiKey: '',
+    openrouterApiKey: '',
+    lmStudioUrl: 'http://localhost:1234',
+    selectedModel: '',
+  });
+  const [availableModels, setAvailableModels] = useState<AiModel[]>([]);
+  const [isModelListLoading, setIsModelListLoading] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<'saving' | 'saved' | ''>('');
+  const [justCompletedObjectiveIds, setJustCompletedObjectiveIds] = useState<Set<number>>(new Set());
 
-  const handleOpenSettings = () => setIsSettingsOpen(true);
-  const handleCloseSettings = () => setIsSettingsOpen(false);
+  // New state for backend connection
+  const [backendStatus, setBackendStatus] = useState<'connected' | 'disconnected' | 'checking'>('checking');
+  const [connectionError, setConnectionError] = useState<string | null>(null);
 
-  const handleSaveSettings = (newSettings: AppSettings) => {
-    setAppSettings(newSettings);
-    localStorage.setItem('appSettings', JSON.stringify(newSettings));
-    if (gameLoopRef.current) {
-      stopAI();
-    }
-    handleCloseSettings();
-  };
 
-  // Enhanced functions
-  const determineAIState = (content: string): AIPersonalityState => {
-    const lowerContent = content.toLowerCase();
-    if (lowerContent.includes('think') || lowerContent.includes('considering') || lowerContent.includes('maybe')) {
-      return 'thinking';
-    } else if (lowerContent.includes('read') || lowerContent.includes('check') || lowerContent.includes('analyze')) {
-      return 'reading';
-    } else if (lowerContent.includes('hehe') || lowerContent.includes('trick') || lowerContent.includes('surprise')) {
-      return 'mischievous';
-    } else if (lowerContent.includes('fun') || lowerContent.includes('play') || lowerContent.includes('game')) {
-      return 'playful';
-    } else if (lowerContent.includes('definitely') || lowerContent.includes('certain') || lowerContent.includes('sure')) {
-      return 'confident';
-    }
-    return 'neutral';
-  };
+  const currentScreenBlob = useRef<Blob | null>(null);
+  const messageIdCounter = useRef(0);
+  const prevObjectivesRef = useRef<Objective[]>([]);
+  const nextObjectiveId = useRef(objectives.length > 0 ? Math.max(...objectives.map(o => o.id)) + 1 : 1);
+  const gameScreenUrlRef = useRef<string | null>(null);
+  
+  const addChatMessage = useCallback((text: string, sender: 'user' | 'ai' | 'system') => {
+    const message: ChatMessage = { id: messageIdCounter.current++, sender, text };
+    setChatHistory(prev => [...prev, message]);
+  }, []);
 
-  const handleEnhancedSendMessage = useCallback(async (message: string) => {
-    if (!message.trim()) return;
-
-    const userMessage = {
-      id: `msg-${enhancedMessageIdCounter.current++}`,
-      role: 'user' as const,
-      content: message,
-      timestamp: new Date()
-    };
-
-    setEnhancedMessages(prev => [...prev, userMessage]);
-
-    try {
-      const response = await fetch(`${SERVER_URL}/api/chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          message: message,
-          api_name: appSettings.apiProvider,
-          api_endpoint: appSettings.apiEndpoint,
-          api_key: appSettings.apiKey,
-          model: appSettings.model,
-        })
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        if (errorData.error && errorData.error.includes('not available') && errorData.available_providers) {
-          const firstAvailableProvider = errorData.available_providers[0];
-          const newSettings = {
-            ...appSettings,
-            apiProvider: firstAvailableProvider as AppSettings['apiProvider']
-          };
-          setAppSettings(newSettings);
-          localStorage.setItem('appSettings', JSON.stringify(newSettings));
-
-          const retryResponse = await fetch(`${SERVER_URL}/api/chat`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              message: message,
-              api_name: firstAvailableProvider,
-              api_endpoint: newSettings.apiEndpoint,
-              api_key: newSettings.apiKey,
-              model: newSettings.model,
-            })
-          });
-
-          if (!retryResponse.ok) {
-            throw new Error('Failed to get chat response');
-          }
-
-          const retryData = await retryResponse.json();
-          const aiMessage = {
-            id: `msg-${enhancedMessageIdCounter.current++}`,
-            role: 'ai' as const,
-            content: retryData.response,
-            timestamp: new Date(),
-            aiState: determineAIState(retryData.response)
-          };
-          setEnhancedMessages(prev => [...prev, aiMessage]);
-        } else {
-          throw new Error(errorData.error || 'Failed to get chat response');
-        }
-      } else {
-        const data = await response.json();
-        const aiMessage = {
-          id: `msg-${enhancedMessageIdCounter.current++}`,
-          role: 'ai' as const,
-          content: data.response,
-          timestamp: new Date(),
-          aiState: determineAIState(data.response)
-        };
-        setEnhancedMessages(prev => [...prev, aiMessage]);
-      }
-    } catch (error) {
-      console.error('Error sending chat message:', error);
-      const errorMessage = {
-        id: `msg-${enhancedMessageIdCounter.current++}`,
-        role: 'ai' as const,
-        content: 'Sorry, I encountered an error. Please try again.',
-        timestamp: new Date(),
-        aiState: 'mischievous' as AIPersonalityState
-      };
-      setEnhancedMessages(prev => [...prev, errorMessage]);
-    }
-  }, [appSettings]);
-
-  // Sidebar configuration
-  const sidebarSections = [
-    {
-      title: 'Game Controls',
-      items: [
-        { id: 'rom', icon: '📁', label: 'Load ROM', onClick: () => {} },
-        { id: 'start', icon: '▶️', label: 'Start AI', onClick: () => aiState === AIStateEnum.IDLE && startAI() },
-        { id: 'stop', icon: '⏹️', label: 'Stop AI', onClick: () => aiState !== AIStateEnum.IDLE && stopAI() },
-        { id: 'reset', icon: '🔄', label: 'Reset Game', onClick: () => {} },
-      ]
-    },
-    {
-      title: 'AI Features',
-      items: [
-        { id: 'chat', icon: '💬', label: 'Chat Interface', onClick: () => {} },
-        { id: 'analysis', icon: '🧠', label: 'Game Analysis', onClick: () => {} },
-        { id: 'strategy', icon: '🎯', label: 'Strategy Mode', onClick: () => {} },
-        { id: 'learning', icon: '📚', label: 'Learning Hub', onClick: () => {} },
-      ]
-    },
-    {
-      title: 'External',
-      items: [
-        { id: 'discord', icon: '💎', label: 'Discord', onClick: () => {} },
-      ]
-    }
-  ];
-
+  // Effect to detect and handle objective completion with race condition protection
   useEffect(() => {
-    let source: EventSource | null = null;
-    let reconnectTimeout: NodeJS.Timeout | null = null;
-    let reconnectAttempts = 0;
-    const maxReconnectAttempts = 5;
+    const prevObjectives = prevObjectivesRef.current;
 
-    const connectSSE = () => {
-      if (!romName) return;
+    // Prevent race conditions by checking if objectives have actually changed
+    const objectivesChanged = JSON.stringify(prevObjectives) !== JSON.stringify(objectives);
 
+    if (!objectivesChanged) return;
+
+    if (prevObjectives.length > 0 || objectives.some(o => o.completed)) {
+        const newlyCompletedObjectives = objectives.filter(currentObj => {
+            const prevObj = prevObjectives.find(p => p.id === currentObj.id);
+            return currentObj.completed && (!prevObj || !prevObj.completed);
+        });
+
+        if (newlyCompletedObjectives.length > 0) {
+            // Batch all objective completion notifications to prevent race conditions
+            const completionTimeouts: NodeJS.Timeout[] = [];
+
+            newlyCompletedObjectives.forEach(obj => {
+                addChatMessage(`Objective complete: '${obj.text}'`, 'system');
+                setJustCompletedObjectiveIds(prev => new Set(prev).add(obj.id));
+
+                const timeout = setTimeout(() => {
+                    setJustCompletedObjectiveIds(prev => {
+                        const newSet = new Set(prev);
+                        newSet.delete(obj.id);
+                        return newSet;
+                    });
+                }, 2000);
+
+                completionTimeouts.push(timeout);
+            });
+
+            // Cleanup function to clear timeouts if component unmounts or dependencies change
+            return () => {
+                completionTimeouts.forEach(timeout => clearTimeout(timeout));
+            };
+        }
+    }
+
+    prevObjectivesRef.current = objectives;
+  }, [objectives, addChatMessage]);
+
+  const handleReorderObjectives = (newObjectives: Objective[]) => {
+    setObjectives(newObjectives);
+  };
+
+  const handleToggleObjective = (id: number) => {
+    setObjectives(prev => prev.map(obj => obj.id === id ? { ...obj, completed: !obj.completed } : obj));
+  };
+
+  const handleDeleteObjective = (id: number) => {
+    setObjectives(prev => prev.filter(obj => obj.id !== id));
+  };
+
+  const handleCreateObjective = (text: string) => {
+    if (!text.trim()) return;
+    const newObjective: Objective = {
+      id: nextObjectiveId.current++,
+      text,
+      completed: false
+    };
+    setObjectives(prev => [...prev, newObjective]);
+  };
+
+  // Cleanup URL objects on unmount and when dependencies change to prevent memory leaks
+  useEffect(() => {
+    return () => {
+      if (gameScreenUrlRef.current) {
+        URL.revokeObjectURL(gameScreenUrlRef.current);
+        gameScreenUrlRef.current = null;
+      }
+      // Also cleanup current blob if it exists
+      if (currentScreenBlob.current) {
+        currentScreenBlob.current = null;
+      }
+    };
+  }, []);
+
+  // Enhanced cleanup for URL objects when game screen URL changes
+  useEffect(() => {
+    return () => {
+      if (gameScreenUrl) {
+        URL.revokeObjectURL(gameScreenUrl);
+      }
+    };
+  }, [gameScreenUrl]);
+
+  // Load state from localStorage on initial mount
+  useEffect(() => {
+    try {
+        const savedStateJSON = localStorage.getItem(SAVE_KEY);
+        if (savedStateJSON) {
+            const savedState = JSON.parse(savedStateJSON);
+
+            if (savedState.appSettings) setAppSettings(savedState.appSettings);
+            if (savedState.aiGoal) setAiGoal(savedState.aiGoal);
+            if (savedState.objectives) {
+              setObjectives(savedState.objectives);
+              nextObjectiveId.current = savedState.objectives.length > 0 ? Math.max(...savedState.objectives.map((o: Objective) => o.id)) + 1 : 1
+            }
+            if (savedState.chatHistory) setChatHistory(savedState.chatHistory);
+            if (savedState.actionHistory) setActionHistory(savedState.actionHistory);
+            if (savedState.achievements) setAchievements(savedState.achievements);
+            if (savedState.party) setParty(savedState.party);
+            if (savedState.inventory) setInventory(savedState.inventory);
+            if (savedState.mapInfo) setMapInfo(savedState.mapInfo);
+            if (savedState.playerStats) setPlayerStats(savedState.playerStats);
+
+            addChatMessage('Session restored from previous state.', 'system');
+        }
+    } catch (error) {
+        console.error("Failed to load state from localStorage", error);
+        addChatMessage('Could not restore previous session.', 'system');
+    }
+  }, [addChatMessage]);
+
+  // Initialize dynamic configuration and backend URL
+  useEffect(() => {
+    const initializeConfiguration = async () => {
       try {
-        source = new EventSource(`${SERVER_URL}/api/stream`);
+        // Try to get optimal backend URL with dynamic port allocation
+        const optimalUrl = await configService.getOptimalBackendUrl();
 
-        source.onopen = () => {
-          console.log('SSE connection established');
-          reconnectAttempts = 0;
-        };
+        // Update settings if the URL changed
+        if (optimalUrl !== appSettings.backendUrl) {
+          setAppSettings(prev => ({
+            ...prev,
+            backendUrl: optimalUrl
+          }));
 
-        source.onmessage = (event) => {
-          try {
-            const data = JSON.parse(event.data);
+          addChatMessage(`Connected to backend at: ${optimalUrl}`, 'system');
+        }
 
-            if (data.error) {
-              console.error('SSE stream error:', data.error);
-              setStreamingStatus('error');
-              return;
-            }
+        // Validate configuration
+        try {
+          const configResponse = await configService.validateConfiguration(optimalUrl);
+          const summary = configService.getConfigurationSummary(configResponse.configuration);
 
-            if (data.image) {
-              setScreenImage(`data:image/jpeg;base64,${data.image}`);
-              setStreamingStatus('connected');
-
-              // Update FPS counter if available
-              if (data.fps) {
-                setStreamingInfo(prev => ({ ...prev, fps: data.fps }));
-              }
-            }
-
-            if (data.status === 'stream_started') {
-              console.log('SSE stream started successfully');
-              setStreamingStatus('connected');
-            }
-          } catch (e) {
-            console.error('SSE parse error:', e);
-            setStreamingStatus('error');
-          }
-        };
-
-        source.onerror = (err) => {
-          console.error('SSE error:', err);
-          setStreamingStatus('disconnected');
-          source?.close();
-
-          // Attempt to reconnect
-          if (reconnectAttempts < maxReconnectAttempts) {
-            reconnectAttempts++;
-            console.log(`Attempting to reconnect... (${reconnectAttempts}/${maxReconnectAttempts})`);
-            reconnectTimeout = setTimeout(connectSSE, Math.min(1000 * Math.pow(2, reconnectAttempts), 30000));
+          if (!summary.hasValidConfig) {
+            addChatMessage('Configuration validation failed. Check server logs.', 'system');
           } else {
-            console.error('Max reconnection attempts reached');
-            setStreamingStatus('failed');
+            addChatMessage(`Configuration validated. ${summary.apiKeyCount} API key(s) configured.`, 'system');
           }
-        };
 
-        setEventSource(source);
+          if (summary.warnings.length > 0) {
+            summary.warnings.forEach(warning => {
+              addChatMessage(`Configuration warning: ${warning}`, 'system');
+            });
+          }
+        } catch (configError) {
+          console.warn('Configuration validation failed, using fallback:', configError);
+          addChatMessage('Using fallback configuration', 'system');
+        }
+
+        // Check backend status with the updated URL
+        const status = await checkBackendStatus(optimalUrl);
+        if (status.success) {
+          setBackendStatus('connected');
+          setConnectionError(null);
+        } else {
+          setBackendStatus('disconnected');
+          setConnectionError(status.message);
+        }
       } catch (error) {
-        console.error('Failed to create SSE connection:', error);
-        setStreamingStatus('failed');
+        console.error('Failed to initialize configuration:', error);
+        addChatMessage('Failed to initialize dynamic configuration', 'system');
+        setBackendStatus('disconnected');
+        setConnectionError('Configuration initialization failed');
       }
     };
 
-    connectSSE();
+    initializeConfiguration();
+  }, []); // Run once on mount
+
+  // Autosave state to localStorage
+  const saveState = useCallback(() => {
+    setSaveStatus('saving');
+    try {
+        const stateToSave = {
+            appSettings,
+            aiGoal,
+            objectives,
+            chatHistory,
+            actionHistory,
+            achievements,
+            party,
+            inventory,
+            mapInfo,
+            playerStats
+        };
+        localStorage.setItem(SAVE_KEY, JSON.stringify(stateToSave));
+        setSaveStatus('saved');
+        setTimeout(() => setSaveStatus(''), 2000);
+    } catch (error) {
+        console.error("Failed to save state to localStorage", error);
+        setSaveStatus('');
+    }
+  }, [appSettings, aiGoal, objectives, chatHistory, actionHistory, achievements, party, inventory, mapInfo, playerStats]);
+
+  useInterval(saveState, 15000); // Save every 15 seconds
+
+  // Global error handler for unhandled promise rejections
+  useEffect(() => {
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      console.error('Unhandled promise rejection:', event.reason);
+      addChatMessage('An unexpected error occurred. Please try again.', 'system');
+      event.preventDefault(); // Prevent the default browser behavior
+    };
+
+    window.addEventListener('unhandledrejection', handleUnhandledRejection);
 
     return () => {
-      if (reconnectTimeout) {
-        clearTimeout(reconnectTimeout);
-      }
-      source?.close();
-      setEventSource(null);
-      setStreamingStatus('disconnected');
+      window.removeEventListener('unhandledrejection', handleUnhandledRejection);
     };
-  }, [romName]);
+  }, [addChatMessage]);
 
-  const addLog = useCallback((message: string, type: AILog['type']) => {
-    setAiLogs(prev => [...prev, { id: logIdCounter.current++, message, type }]);
-  }, []);
+  const refreshFullGameState = useCallback(async () => {
+    if (!isRomLoaded || backendStatus !== 'connected') return;
+    try {
+      const screenBlob = await getScreen(appSettings.backendUrl);
 
-  const addChatMessage = useCallback((message: string, sender: 'user' | 'ai') => {
-    setChatHistory(prev => [...prev, { id: chatIdCounter.current++, text: message, sender }]);
-  }, []);
+      // Cleanup previous blob if it exists
+      if (currentScreenBlob.current) {
+        currentScreenBlob.current = null;
+      }
 
-  // Validate and fix provider settings on startup
+      currentScreenBlob.current = screenBlob;
+      const newUrl = URL.createObjectURL(screenBlob);
+
+      setGameScreenUrl(prevUrl => {
+        if (prevUrl && prevUrl !== gameScreenUrlRef.current) {
+          URL.revokeObjectURL(prevUrl);
+        }
+        if (gameScreenUrlRef.current && gameScreenUrlRef.current !== prevUrl) {
+          URL.revokeObjectURL(gameScreenUrlRef.current);
+        }
+        gameScreenUrlRef.current = newUrl;
+        return newUrl;
+      });
+
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
+      setBackendStatus('disconnected');
+      setConnectionError(errorMessage);
+      setAiState(AIStateEnum.IDLE);
+    }
+  }, [isRomLoaded, appSettings.backendUrl, backendStatus]);
+
+  // Initial and on-change check for backend connection
   useEffect(() => {
-    const validateProvider = async () => {
-      try {
-        const response = await fetch(`${SERVER_URL}/api/providers/status`);
-        if (response.ok) {
-          const providerStatus = await response.json();
-          const availableProviders = Object.entries(providerStatus)
-            .filter(([_, info]: [string, any]) => info.available)
-            .map(([name, _]: [string, any]) => name);
+    const connectToBackend = async () => {
+        if (!appSettings.backendUrl) {
+            setBackendStatus('disconnected');
+            setConnectionError("Pyboy Server URL is not set in settings.");
+            return;
+        }
 
-          if (availableProviders.length > 0 && !availableProviders.includes(appSettings.apiProvider)) {
-            // Current provider is not available, switch to the first available one
-            const newProvider = availableProviders[0] as AppSettings['apiProvider'];
-            const newSettings = {
-              ...appSettings,
-              apiProvider: newProvider
-            };
-            setAppSettings(newSettings);
-            localStorage.setItem('appSettings', JSON.stringify(newSettings));
-            addLog(`Auto-switched from unavailable provider to '${newProvider}'`, 'info');
-          }
+        setBackendStatus('checking');
+        setConnectionError(null);
+        
+        const result = await checkBackendStatus(appSettings.backendUrl);
+        
+        if (result.success) {
+            setBackendStatus('connected');
+            addChatMessage(result.message, 'system');
+            // After connecting, try a state refresh in case a ROM is already loaded on the backend.
+            refreshFullGameState();
+        } else {
+            setBackendStatus('disconnected');
+            setConnectionError(result.message);
+        }
+    };
+    connectToBackend();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appSettings.backendUrl, addChatMessage]);
+
+
+  useEffect(() => {
+    const loadModels = async () => {
+      if (
+        (appSettings.aiProvider === 'google' && !appSettings.googleApiKey) ||
+        (appSettings.aiProvider === 'openrouter' && !appSettings.openrouterApiKey) ||
+        (appSettings.aiProvider === 'lmstudio' && !appSettings.lmStudioUrl)
+      ) {
+        setAvailableModels([]);
+        return;
+      }
+
+      setIsModelListLoading(true);
+      setAvailableModels([]);
+      try {
+        const models = await fetchAvailableModels(appSettings);
+        setAvailableModels(models);
+        if (models.length > 0 && !models.find(m => m.id === appSettings.selectedModel)) {
+            setAppSettings(prev => ({...prev, selectedModel: models[0].id }));
         }
       } catch (error) {
-        console.error('Error validating provider:', error);
+        const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
+        console.error("Failed to load models:", error);
+        addChatMessage(`Failed to load models for ${appSettings.aiProvider}: ${errorMessage}`, 'system');
+      } finally {
+        setIsModelListLoading(false);
       }
     };
 
-    validateProvider();
-  }, [addLog]); // Run only once on startup
+    loadModels();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appSettings.aiProvider, appSettings.googleApiKey, appSettings.openrouterApiKey, appSettings.lmStudioUrl]);
 
-  // Function to update the screen from the server
-  const updateScreen = useCallback(async () => {
+  
+  const refreshScreen = useCallback(async () => {
+    if (!isRomLoaded || backendStatus !== 'connected') return;
     try {
-      const response = await fetch(`${SERVER_URL}/api/screen`);
-      if (!response.ok) {
-        throw new Error('Failed to get screen');
-      }
-      
-      const data = await response.json();
-      setScreenImage(`data:image/jpeg;base64,${data.image}`);
-    } catch (error) {
-      console.error('Error updating screen:', error);
-    }
-  }, []);
+        const screenBlob = await getScreen(appSettings.backendUrl);
 
-  // Function to load a ROM
-  const loadRom = useCallback(async (file: File) => {
-    try {
-      const formData = new FormData();
-      formData.append('rom_file', file);
-      formData.append('emulator_type', emulatorMode);
-      
-      setLoading(true);
-      addLog(`Uploading ROM: ${file.name}`, 'info');
-      
-      const response = await fetch(`${SERVER_URL}/api/upload-rom`, {
-        method: 'POST',
-        body: formData
-      });
-      
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Upload failed');
-      }
-      
-      const result = await response.json();
-      setRomName(file.name);
-      addLog(`Loaded ROM: ${file.name}`, 'info');
-      console.log('ROM loaded:', result);
-      
-      await updateScreen();
-      setLoading(false);
-    } catch (error) {
-      console.error('Error loading ROM:', error);
-      addLog(`Error loading ROM: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error');
-      setLoading(false);
-    }
-  }, [emulatorMode, addLog, updateScreen]);
-
-  // Function to execute an action
-  const executeAction = useCallback(async (action: string) => {
-    try {
-      const response = await fetch(`${SERVER_URL}/api/action`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          action: action,
-          frames: 10
-        })
-      });
-      
-      if (!response.ok) {
-        throw new Error('Failed to execute action');
-      }
-      
-      await updateScreen();
-    } catch (error) {
-      console.error('Error executing action:', error);
-      addLog(`Error executing action: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error');
-    }
-  }, [addLog, updateScreen]);
-
-  // Function to get AI next move
-  const getAINextMove = useCallback(async (goal: string) => {
-    try {
-      const response = await fetch(`${SERVER_URL}/api/ai-action`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          api_name: appSettings.apiProvider,
-          api_endpoint: appSettings.apiEndpoint,
-          api_key: appSettings.apiKey,
-          model: appSettings.model,
-          goal: goal
-        })
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-
-        // Check if the error is about an unavailable provider
-        if (errorData.error && errorData.error.includes('not available') && errorData.available_providers) {
-          // Automatically switch to the first available provider
-          const firstAvailableProvider = errorData.available_providers[0];
-          addLog(`Provider '${appSettings.apiProvider}' not available. Switching to '${firstAvailableProvider}'`, 'info');
-
-          // Update settings to use the available provider
-          const newSettings = {
-            ...appSettings,
-            apiProvider: firstAvailableProvider as AppSettings['apiProvider']
-          };
-          setAppSettings(newSettings);
-          localStorage.setItem('appSettings', JSON.stringify(newSettings));
-
-          // Retry with the new provider
-          const retryResponse = await fetch(`${SERVER_URL}/api/ai-action`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              api_name: firstAvailableProvider,
-              api_endpoint: newSettings.apiEndpoint,
-              api_key: newSettings.apiKey,
-              model: newSettings.model,
-              goal: goal
-            })
-          });
-
-          if (!retryResponse.ok) {
-            throw new Error('Failed to get AI action even with available provider');
-          }
-
-          const retryData = await retryResponse.json();
-          return retryData.action;
+        // Cleanup previous blob if it exists
+        if (currentScreenBlob.current) {
+            currentScreenBlob.current = null;
         }
 
-        throw new Error(errorData.error || 'Failed to get AI action');
-      }
+        currentScreenBlob.current = screenBlob;
+        const newUrl = URL.createObjectURL(screenBlob);
 
-      const data = await response.json();
-      return data.action;
+        setGameScreenUrl(prevUrl => {
+            if (prevUrl && prevUrl !== gameScreenUrlRef.current) {
+                URL.revokeObjectURL(prevUrl);
+            }
+            if (gameScreenUrlRef.current && gameScreenUrlRef.current !== prevUrl) {
+                URL.revokeObjectURL(gameScreenUrlRef.current);
+            }
+            gameScreenUrlRef.current = newUrl;
+            return newUrl;
+        });
     } catch (error) {
-      console.error('Error getting AI action:', error);
-      addLog(`Error getting AI action: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error');
-      return 'SELECT'; // Default safe action
+        // Only transition to disconnected state on first failure to avoid log spam
+        if (backendStatus === 'connected') {
+            const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
+            setBackendStatus('disconnected');
+            setConnectionError(errorMessage);
+            addChatMessage(`Connection lost. Screen stream failed.`, 'system');
+        }
     }
-  }, [addLog, appSettings]);
+  }, [isRomLoaded, appSettings.backendUrl, backendStatus, addChatMessage]);
 
-  const runAI = useCallback(async () => {
-    if (!romName) {
-      addLog("Cannot start AI: No ROM loaded.", 'error');
-      setAiState(AIStateEnum.IDLE);
-      return;
-    }
+  const aiTick = useCallback(async () => {
+    if (aiState !== AIStateEnum.RUNNING || !isRomLoaded) return;
+
     setAiState(AIStateEnum.THINKING);
-    setAiPersonality('thinking');
-    addLog("AI is thinking...", 'thought');
 
     try {
-      const nextAction = await getAINextMove(aiGoal);
+        await refreshFullGameState();
 
-      actionHistoryRef.current.push(nextAction);
-      addLog(`AI chose action: ${nextAction}`, 'action');
-      setLastAIAction(nextAction as GameAction);
+        if (!currentScreenBlob.current) {
+            console.error("No screen data available for AI to process.");
+            addChatMessage("Could not retrieve game screen.", 'system');
+            setAiState(AIStateEnum.RUNNING);
+            return;
+        }
 
-      await executeAction(nextAction);
+        const currentGoal = aiGoal || "Explore the world.";
+        const { reasoning, action } = await getAIThoughtAndAction(appSettings, currentScreenBlob.current, currentGoal, objectives, actionHistory, mapInfo, dialogue);
 
-      setTimeout(() => setLastAIAction(null), 500);
-      setAiState(AIStateEnum.RUNNING);
-      setAiPersonality('confident');
+        setCurrentReasoning(reasoning);
+        setActionHistory(prev => [...prev, action]);
+
+        await sendAction(appSettings.backendUrl, action);
+
+        setAiState(AIStateEnum.RUNNING);
 
     } catch (error) {
-      console.error(error);
-      const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
-      addLog(`Error: ${errorMessage}`, 'error');
-      setAiState(AIStateEnum.ERROR);
-      setAiPersonality('mischievous');
-      if (gameLoopRef.current) {
-        clearInterval(gameLoopRef.current);
-        gameLoopRef.current = null;
-      }
-    }
-  }, [romName, aiGoal, addLog, getAINextMove, executeAction]);
+        const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
+        console.error('AI tick operation failed:', error);
+        addChatMessage(`AI operation failed: ${errorMessage}`, 'system');
+        setCurrentReasoning(`Error: ${errorMessage}`);
+        setAiState(AIStateEnum.RUNNING);
 
-  const startAI = () => {
-    if (gameLoopRef.current) return;
-    setAiLogs([]);
-    actionHistoryRef.current = [];
-    addLog(`AI started with objective: "${aiGoal}"`, 'info');
-    setAiState(AIStateEnum.RUNNING);
-    setAiPersonality('confident');
-    runAI();
-    gameLoopRef.current = window.setInterval(runAI, appSettings.aiActionInterval);
-  };
-
-  const stopAI = () => {
-    if (gameLoopRef.current) {
-      clearInterval(gameLoopRef.current);
-      gameLoopRef.current = null;
+        // Prevent unhandled promise rejection
+        return Promise.resolve();
     }
-    addLog("AI stopped by user.", 'info');
-    setAiState(AIStateEnum.IDLE);
-    setAiPersonality('neutral');
-  };
+  }, [aiState, actionHistory, refreshFullGameState, aiGoal, objectives, addChatMessage, isRomLoaded, appSettings, mapInfo, dialogue]);
+
+  // Main AI action loop
+  useInterval(aiTick, aiState === AIStateEnum.RUNNING && isRomLoaded ? appSettings.aiActionInterval : null);
   
-  const handleRomLoad = (file: File) => {
-    setRomName(file.name);
-    addLog(`Loaded ROM: ${file.name}`, 'info');
-    loadRom(file);
+  // Constant screen refresh for visual feedback
+  useInterval(refreshScreen, isRomLoaded && aiState !== AIStateEnum.THINKING ? STREAM_INTERVAL_MS : null);
+
+  // Slower state refresh for panels when AI is idle
+  useInterval(refreshFullGameState, aiState === AIStateEnum.IDLE && isRomLoaded ? IDLE_STATE_REFRESH_MS : null);
+
+  const handleToggleAI = () => {
+    if (!isRomLoaded) return;
+    if (aiState === AIStateEnum.IDLE) {
+      setActionHistory([]);
+      setCurrentReasoning("AI is starting...");
+      addChatMessage('AI starting...', 'system');
+      setAiState(AIStateEnum.RUNNING);
+    } else {
+      addChatMessage('AI stopped by user.', 'system');
+      setCurrentReasoning("AI stopped by user.");
+      setAiState(AIStateEnum.IDLE);
+    }
   };
 
-  const handleSendMessage = useCallback(async (message: string) => {
-    if (!message.trim()) return;
+  const handleSendMessage = async () => {
+    if (!chatInput.trim() || isChatting) return;
 
-    addChatMessage(message, 'user');
+    const userMessage = chatInput;
+    addChatMessage(userMessage, 'user');
     setChatInput('');
     setIsChatting(true);
 
     try {
-      const response = await fetch(`${SERVER_URL}/api/chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          message: message,
-          api_name: appSettings.apiProvider,
-          api_endpoint: appSettings.apiEndpoint,
-          api_key: appSettings.apiKey,
-          model: appSettings.model,
-        })
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-
-        // Check if the error is about an unavailable provider
-        if (errorData.error && errorData.error.includes('not available') && errorData.available_providers) {
-          // Automatically switch to the first available provider
-          const firstAvailableProvider = errorData.available_providers[0];
-          addLog(`Provider '${appSettings.apiProvider}' not available. Switching to '${firstAvailableProvider}' for chat`, 'info');
-
-          // Update settings to use the available provider
-          const newSettings = {
-            ...appSettings,
-            apiProvider: firstAvailableProvider as AppSettings['apiProvider']
-          };
-          setAppSettings(newSettings);
-          localStorage.setItem('appSettings', JSON.stringify(newSettings));
-
-          // Retry with the new provider
-          const retryResponse = await fetch(`${SERVER_URL}/api/chat`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              message: message,
-              api_name: firstAvailableProvider,
-              api_endpoint: newSettings.apiEndpoint,
-              api_key: newSettings.apiKey,
-              model: newSettings.model,
-            })
-          });
-
-          if (!retryResponse.ok) {
-            throw new Error('Failed to get chat response even with available provider');
-          }
-
-          const retryData = await retryResponse.json();
-          addChatMessage(retryData.response, 'ai');
-        } else {
-          throw new Error(errorData.error || 'Failed to get chat response');
-        }
-      } else {
-        const data = await response.json();
-        addChatMessage(data.response, 'ai');
-      }
+        // FIX: Corrected variable name from 'user_message' to 'userMessage'.
+        const aiResponseText = await getChatResponse(appSettings, userMessage);
+        addChatMessage(aiResponseText, 'ai');
     } catch (error) {
-      console.error('Error sending chat message:', error);
-      addChatMessage('Sorry, I encountered an error. Please try again.', 'ai');
+        const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
+        console.error('Failed to get AI chat response:', error);
+        addChatMessage(`AI chat failed: ${errorMessage}`, 'system');
     } finally {
-      setIsChatting(false);
+        setIsChatting(false);
     }
-  }, [addChatMessage, addLog, appSettings]);
+  };
 
-  useEffect(() => {
-    // Add event listener for manual control input
-    const handleControlPress = (event: CustomEvent) => {
-      const action = event.detail;
-      if (romName) {
-        executeAction(action);
-        // Briefly show the action as active for visual feedback
-        setLastAIAction(action as GameAction);
-        setTimeout(() => setLastAIAction(null), 200);
-      }
-    };
-
-    window.addEventListener('game-control-press', handleControlPress as EventListener);
-
-    return () => {
-      if (gameLoopRef.current) {
-        clearInterval(gameLoopRef.current);
-      }
-      window.removeEventListener('game-control-press', handleControlPress as EventListener);
-    };
-  }, [romName, executeAction]);
-
-  // Update game stats based on AI state
-  useEffect(() => {
-    if (aiState === AIStateEnum.RUNNING) {
-      setGameStats(prev => ({
-        ...prev,
-        step: prev.step + 1,
-        isPlaying: true
-      }));
-    } else {
-      setGameStats(prev => ({
-        ...prev,
-        isPlaying: false
-      }));
+  const handleSaveSettings = (newSettings: AppSettings) => {
+    if (newSettings.aiProvider !== appSettings.aiProvider) {
+      newSettings.selectedModel = '';
     }
-  }, [aiState]);
+    setAppSettings(newSettings);
+    setIsSettingsOpen(false);
+    addChatMessage(`Settings updated. AI Provider: ${newSettings.aiProvider}.`, 'system');
+  };
+
+  const handleLoadRom = async (file: File) => {
+    try {
+        await loadRom(appSettings.backendUrl, file);
+        setIsRomLoaded(true);
+        setCurrentReasoning("Successfully loaded ROM. Ready for instructions.");
+        addChatMessage(`Successfully loaded ${file.name}.`, 'system');
+        await refreshFullGameState(); // Fetch the first screen and state immediately after loading.
+    } catch (error) {
+        const message = error instanceof Error ? error.message : "An unknown error occurred.";
+        setBackendStatus('disconnected');
+        setConnectionError(message);
+        addChatMessage(`Failed to load ROM: ${message}`, 'system');
+        setIsRomLoaded(false);
+        throw error; // Re-throw to let RomLoader component handle its UI state
+    }
+  };
+  
+  const handleSaveState = async () => {
+    if (!isRomLoaded) return;
+    try {
+      await saveGameState(appSettings.backendUrl);
+      addChatMessage('Game state saved.', 'system');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "An unknown error occurred.";
+      addChatMessage(`Failed to save state: ${message}`, 'system');
+    }
+  };
+
+  const handleLoadState = async () => {
+    if (!isRomLoaded) return;
+    try {
+      await loadGameState(appSettings.backendUrl);
+      addChatMessage('Game state loaded.', 'system');
+      await refreshFullGameState(); // Refresh screen immediately after loading
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "An unknown error occurred.";
+      addChatMessage(`Failed to load state: ${message}`, 'system');
+    }
+  };
+
 
   return (
-    <div className="h-screen w-screen flex bg-gray-900 text-white">
-      {/* Enhanced Sidebar */}
-      {useEnhancedUI && <CollapsibleSidebar sections={sidebarSections} />}
-
-      {/* Main Content */}
-      <div className="flex-1 flex flex-col">
+    <ErrorBoundary
+      onError={(error, errorInfo) => {
+        console.error('App ErrorBoundary caught an error:', error, errorInfo);
+        // Optionally log to error reporting service
+      }}
+    >
+      <div className="h-screen w-full flex flex-col bg-neutral-950 font-sans overflow-hidden">
         <Header
-          emulatorMode={emulatorMode}
-          onModeChange={setEmulatorMode}
-          onOpenSettings={handleOpenSettings}
-          useEnhancedUI={useEnhancedUI}
-          onToggleEnhancedUI={toggleEnhancedUI}
+          achievements={achievements}
+          onOpenSettings={() => setIsSettingsOpen(true)}
+          runtime={playerStats.runtime}
+          steps={playerStats.steps}
+          saveStatus={saveStatus}
         />
-
-        <div className="flex-1 flex overflow-hidden">
-          {/* Game Area */}
-          <div className="flex-1 flex flex-col p-4">
-            <div className="h-full flex flex-col bg-gray-800 rounded-lg shadow-xl">
-              {/* Game Stats Bar */}
-              {useEnhancedUI && (
-                <div className="p-4 border-b border-gray-700">
-                  <GameStateDisplay
-                    step={gameStats.step}
-                    location={gameStats.location}
-                    isPlaying={aiState === AIStateEnum.RUNNING}
-                  />
-                </div>
-              )}
-
-              {/* Emulator Screen */}
-              <div className="flex-1 p-4">
-                <EmulatorScreen
-                  emulatorMode={emulatorMode}
-                  romName={romName}
-                  onRomLoad={handleRomLoad}
-                  aiState={aiState}
-                  screenImage={screenImage}
-                  streamingStatus={streamingStatus}
-                  streamingInfo={streamingInfo}
-                />
-              </div>
-
-              {/* Controls */}
-              <div className="p-4 border-t border-gray-700">
-                <Controls lastAction={lastAIAction} />
-              </div>
-            </div>
-          </div>
-
-          {/* Right Panel - Enhanced Chat or Traditional AIPanel */}
-          {useEnhancedUI ? (
-            <div className="w-96 bg-gray-900 border-l border-gray-800 flex flex-col">
-              {/* AI Personality Header */}
-              <div className="p-4 border-b border-gray-800">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-3">
-                    <AIPersonalityAvatar state={aiPersonality} size="md" />
-                    <div>
-                      <h3 className="font-semibold">AI Assistant</h3>
-                      <p className="text-sm text-gray-400 capitalize">{aiPersonality}</p>
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <div className="text-xs text-gray-500">Status</div>
-                    <div className="text-sm font-medium">
-                      {aiState === AIStateEnum.RUNNING ? '🟢 Playing' :
-                       aiState === AIStateEnum.THINKING ? '🟡 Thinking' :
-                       aiState === AIStateEnum.ERROR ? '🔴 Error' : '⚪ Idle'}
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Enhanced Chat Interface */}
-              <EnhancedChatInterface
-                messages={enhancedMessages}
-                onSendMessage={handleEnhancedSendMessage}
-                gameState={{
-                  step: gameStats.step,
-                  location: gameStats.location,
-                  isPlaying: aiState === AIStateEnum.RUNNING
-                }}
+        <main className="flex-grow grid grid-cols-1 md:grid-cols-12 gap-4 p-4 min-h-0 overflow-y-auto">
+          <div className="md:col-span-4 lg:col-span-3 min-h-0">
+            <ErrorBoundary>
+              <AIPanel
+                aiState={aiState}
+                aiGoal={aiGoal}
+                currentReasoning={currentReasoning}
+                actionHistory={actionHistory}
+                chatHistory={chatHistory}
+                chatInput={chatInput}
+                isChatting={isChatting}
+                isRomLoaded={isRomLoaded}
+                onScreenText={dialogue}
+                onGoalChange={setAiGoal}
+                onStart={handleToggleAI}
+                onStop={handleToggleAI}
+                onChatInputChange={setChatInput}
+                onSendMessage={handleSendMessage}
               />
-            </div>
-          ) : (
-            <AIPanel
-              aiState={aiState}
-              aiLogs={aiLogs}
-              aiGoal={aiGoal}
-              chatHistory={chatHistory}
-              chatInput={chatInput}
-              isChatting={isChatting}
-              onGoalChange={setAiGoal}
-              onStart={startAI}
-              onStop={stopAI}
-              onChatInputChange={setChatInput}
-              onSendMessage={() => handleSendMessage(chatInput)}
-            />
-          )}
-        </div>
+            </ErrorBoundary>
+          </div>
+          <div className="md:col-span-8 lg:col-span-5 min-h-0">
+            <ErrorBoundary>
+              <GamePanel
+                party={party}
+                gameScreenUrl={gameScreenUrl}
+                lastAction={actionHistory.length > 0 ? actionHistory[actionHistory.length - 1] : null}
+                isRomLoaded={isRomLoaded}
+                onLoadRom={handleLoadRom}
+                onSaveState={handleSaveState}
+                onLoadState={handleLoadState}
+                backendStatus={backendStatus}
+                connectionError={connectionError}
+                onOpenSettings={() => setIsSettingsOpen(true)}
+              />
+            </ErrorBoundary>
+          </div>
+          <div className="md:col-span-12 lg:col-span-4 min-h-0">
+            <ErrorBoundary>
+              <StatePanel
+                objectives={objectives}
+                inventory={inventory}
+                inventoryTitle="INVENTORY (Key Items)"
+                mapInfo={mapInfo}
+                money={playerStats.money}
+                onReorderObjectives={handleReorderObjectives}
+                achievements={achievements}
+                playerStats={playerStats}
+                justCompletedObjectiveIds={justCompletedObjectiveIds}
+                onToggleObjective={handleToggleObjective}
+                onDeleteObjective={handleDeleteObjective}
+                onCreateObjective={handleCreateObjective}
+              />
+            </ErrorBoundary>
+          </div>
+        </main>
+        <ErrorBoundary>
+          <SettingsModal
+            isOpen={isSettingsOpen}
+            onClose={() => setIsSettingsOpen(false)}
+            currentSettings={appSettings}
+            onSave={handleSaveSettings}
+            availableModels={availableModels}
+            isModelListLoading={isModelListLoading}
+          />
+        </ErrorBoundary>
       </div>
-
-      <SettingsModal
-        isOpen={isSettingsOpen}
-        onClose={handleCloseSettings}
-        currentSettings={appSettings}
-        onSave={handleSaveSettings}
-      />
-    </div>
+    </ErrorBoundary>
   );
 };
 
